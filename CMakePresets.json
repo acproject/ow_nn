@@ -1,0 +1,52 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 19, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ninja-debug",
+      "displayName": "Debug (Ninja, clang++)",
+      "generator": "Ninja",
+      "binaryDir": "build/debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Release (Ninja, clang++)",
+      "inherits": "ninja-debug",
+      "binaryDir": "build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ninja-debug",
+      "displayName": "Build (Debug)",
+      "configurePreset": "ninja-debug",
+      "jobs": 8
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Build (Release)",
+      "configurePreset": "ninja-release",
+      "jobs": 8
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "ninja-debug",
+      "displayName": "Test (Debug)",
+      "configurePreset": "ninja-debug"
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Test (Release)",
+      "configurePreset": "ninja-release"
+    }
+  ]
+}
