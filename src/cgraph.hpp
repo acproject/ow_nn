@@ -45,16 +45,23 @@ struct ComputeGraph {
       for (auto &in : nodes[i].inputs) {
         consumers[in].push_back((int)i);
       }
-      need_count[nodes[i].name] = (int)nodes[i].inputs.size();
+      // 未满足的依赖：仅统计那些在 tensors 中尚不存在的输入
+      int unmet = 0;
+      for (auto &in : nodes[i].inputs) {
+        if (tensors.find(in) == tensors.end()) {
+          ++unmet;
+        }
+      }
+      need_count[nodes[i].name] = unmet;
     }
     ThreadPool tp(std::max<size_t>(1, std::thread::hardware_concurrency()));
     std::queue<int> q;
     std::mutex mq;
     std::condition_variable mcv;
     std::atomic<int> remaining((int)nodes.size());
-    // initially push nodes with zero inputs
+    // initially push nodes with all deps satisfied (包括已有输入)
     for (size_t i = 0; i < nodes.size(); ++i) {
-      if (nodes[i].inputs.empty())
+      if (need_count[nodes[i].name] == 0)
         q.push((int)i);
     }
     // lambda to schedule node

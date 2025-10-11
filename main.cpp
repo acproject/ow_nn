@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
   try {
     ow::nn::Tokenizer tokenizer(vocab_path, merges_path);
     std::string input;
-    std::cout << "Enter a sentence: ";
+    std::cout << "Enter a sentence: " << std::flush;
     std::getline(std::cin, input);
     auto tokens = tokenizer.encode(input);
     std::cout << "Encoded IDs: ";

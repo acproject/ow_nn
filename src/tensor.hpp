@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
 
 // 前缀声明，用于定义下面的智能指针
 namespace ow::nn {

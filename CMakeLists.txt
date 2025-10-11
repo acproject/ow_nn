@@ -33,7 +33,12 @@ add_subdirectory(src)
 add_executable(ow_nn_main ${CMAKE_SOURCE_DIR}/main.cpp)
 target_link_libraries(ow_nn_main PRIVATE ow_nn)
 set_target_properties(ow_nn_main PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
+)
+
+# 在链接前确保输出目录存在（VS 多配置生成器）
+add_custom_command(TARGET ow_nn_main PRE_LINK
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ow_nn_main>"
 )
 
 # 导出编译命令（用于IDE）
