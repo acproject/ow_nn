@@ -87,7 +87,7 @@ struct MMapFile {
 struct MMapFile { std::vector<uint8_t> buf; void* base=nullptr; size_t size=0; explicit MMapFile(const std::string &path){std::ifstream ifs(path, std::ios::binary); if(!ifs) throw std::runtime_error("open fail:"+path); ifs.seekg(0,std::ios::end); size_t s=(size_t)ifs.tellg(); ifs.seekg(0); buf.resize(s); ifs.read((char*)buf.data(), (std::streamsize)s); base=buf.data(); size=s; } };
 #endif
 
-struct STEntry { DType dtype; std::vector<int> shape; size_t nbytes; size_t file_offset; };
+struct STEntry { std::string st_dtype; std::vector<int> shape; size_t nbytes; size_t file_offset; };
 struct STFile { std::string path; std::shared_ptr<MMapFile> mm; uint64_t header_len=0; size_t data_base=0; std::unordered_map<std::string, STEntry> entries; };
 
 // Parse header and build entries
@@ -113,7 +113,7 @@ static inline void parse_safetensors_header(STFile &f){
     for(auto &v: shape_j) shape.push_back(v.get<int>());
     size_t expect = st_dtype_size(dtype); for(int d:shape) expect*= (size_t)d;
     if(expect!=nbytes) throw std::runtime_error("size mismatch:"+name);
-    STEntry e; e.dtype=st_to_dtype(dtype); e.shape=shape; e.nbytes=nbytes; e.file_offset=f.data_base+begin;
+    STEntry e; e.st_dtype=dtype; e.shape=shape; e.nbytes=nbytes; e.file_offset=f.data_base+begin;
     f.entries.emplace(name,e);
   }
 }
@@ -195,18 +195,61 @@ struct SafetensorsLoader {
     return out;
   }
 
+  static inline void convert_bf16_to_f32(const uint8_t* src_bytes, float* dst, size_t n){
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(src_bytes);
+    for(size_t i=0;i<n;i++){
+      uint32_t u = (uint32_t)src[i] << 16;
+      std::memcpy(&dst[i], &u, sizeof(uint32_t));
+    }
+  }
+
   TensorPtr make_tensor(const std::string &name, const std::shared_ptr<Context> &ctx, bool copy=false){
     auto it=index.find(name); if(it==index.end()) throw std::runtime_error("tensor not found:"+name);
     int fid=it->second.first; const STEntry &e=it->second.second; const STFile &f=files[fid];
     const uint8_t* src = reinterpret_cast<const uint8_t*>(f.mm->base)+ e.file_offset;
-    if(copy){ auto T = Tensor::create(ctx, e.shape, e.dtype); std::memcpy(T->data, src, e.nbytes); return T; }
-    // 零拷贝视图：保持 mmap 文件生命周期 + 正确删除临时 Tensor
-    Tensor *raw = new Tensor(e.dtype, e.shape);
-    raw->data = const_cast<uint8_t*>(src);
-    raw->ctx = ctx;
-    auto owner = f.mm; // 捕获以保持映射有效
-    std::shared_ptr<Tensor> T(raw, [owner](Tensor *p){ delete p; });
-    return T;
+    // Handle dtype cases
+    const std::string &sd = e.st_dtype;
+    if(sd=="F32"){
+      if(copy){ auto T = Tensor::create(ctx, e.shape, DType::FLOAT32); std::memcpy(T->data, src, e.nbytes); return T; }
+      Tensor *raw = new Tensor(DType::FLOAT32, e.shape);
+      raw->data = const_cast<uint8_t*>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p){ delete p; });
+      return T;
+    } else if(sd=="F16"){
+      if(copy){ auto T = Tensor::create(ctx, e.shape, DType::FP16); std::memcpy(T->data, src, e.nbytes); return T; }
+      Tensor *raw = new Tensor(DType::FP16, e.shape);
+      raw->data = const_cast<uint8_t*>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p){ delete p; });
+      return T;
+    } else if(sd=="I32"){
+      if(copy){ auto T = Tensor::create(ctx, e.shape, DType::INT32); std::memcpy(T->data, src, e.nbytes); return T; }
+      Tensor *raw = new Tensor(DType::INT32, e.shape);
+      raw->data = const_cast<uint8_t*>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p){ delete p; });
+      return T;
+    } else if(sd=="I8"){
+      if(copy){ auto T = Tensor::create(ctx, e.shape, DType::INT8); std::memcpy(T->data, src, e.nbytes); return T; }
+      Tensor *raw = new Tensor(DType::INT8, e.shape);
+      raw->data = const_cast<uint8_t*>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p){ delete p; });
+      return T;
+    } else if(sd=="BF16"){
+      // Convert to FLOAT32
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_bf16_to_f32(src, reinterpret_cast<float*>(T->data), n);
+      return T;
+    } else {
+      throw std::runtime_error("unsupported dtype for ow::nn:"+sd);
+    }
   }
 
   std::unordered_map<std::string, TensorPtr> load_all(const std::shared_ptr<Context> &ctx, bool copy=false){
