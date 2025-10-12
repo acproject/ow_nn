@@ -5,6 +5,7 @@ set(SOURCES
     thread_pool.hpp
     tensor.hpp
     cgraph.hpp
+    safetensors_loader.hpp
 )
 
 # 创建静态库

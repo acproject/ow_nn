@@ -4,6 +4,7 @@
 #include "src/context.hpp"
 #include "src/tensor.hpp"
 #include "src/cgraph.hpp"
+#include "src/safetensors_loader.hpp"
 
 #include <cstddef>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <thread>
 #include <vector>
 #include <chrono>
+#include <filesystem>
 
 void fill_tensor_from_vector(const ow::nn::TensorPtr &T,
                              const std::vector<float> &vals) {
@@ -21,6 +23,17 @@ void fill_tensor_from_vector(const ow::nn::TensorPtr &T,
   }
   for (size_t i = 0; i < vals.size(); ++i)
     T->set_from_float_flat(i, vals[i]);
+}
+
+static const char* dtype_to_cstr(ow::nn::DType dt){
+  switch(dt){
+    case ow::nn::DType::FLOAT32: return "FLOAT32";
+    case ow::nn::DType::INT32: return "INT32";
+    case ow::nn::DType::FP16: return "FP16";
+    case ow::nn::DType::INT8: return "INT8";
+    case ow::nn::DType::Q4_0: return "Q4_0";
+    default: return "UNKNOWN";
+  }
 }
 
 int main(int argc, char **argv) {
@@ -175,6 +188,42 @@ int main(int argc, char **argv) {
     }
     std::cout << "\n";
   }
+
+  // ---- HuggingFace safetensors loader demo ----
+  try {
+    std::string model_dir = "model";
+    std::string abs_model_dir = "d:/workspace/cpp_projects/ow_nn/model";
+    if (std::filesystem::exists(abs_model_dir)) model_dir = abs_model_dir;
+    else if (!std::filesystem::exists(model_dir)) {
+      std::cout << "Model directory not found, skip safetensors demo." << std::endl;
+      goto skip_st_demo;
+    }
+    ow::nn::SafetensorsLoader loader;
+    loader.load_dir(model_dir);
+    auto names = loader.names();
+    std::cout << "Loaded safetensors dir: " << model_dir << ", tensors: " << names.size() << std::endl;
+    int print_count = 0;
+    for (auto &nm : names) {
+      auto T = loader.make_tensor(nm, ctx, false); // zero-copy view
+      std::cout << "  name= " << nm << ", dtype=" << dtype_to_cstr(T->dtype) << ", shape=[";
+      for (size_t i = 0; i < T->shape.size(); ++i) {
+        std::cout << T->shape[i];
+        if (i + 1 < T->shape.size()) std::cout << ",";
+      }
+      std::cout << "]";
+      // print first few values if FLOAT32/FP16/INT32/INT8
+      size_t show = std::min<size_t>(5, T->nelements());
+      if (show > 0) {
+        std::cout << " sample: ";
+        for (size_t i = 0; i < show; ++i) std::cout << T->get_as_float_flat(i) << " ";
+      }
+      std::cout << "\n";
+      if (++print_count >= 10) break;
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Safetensors demo error: " << e.what() << std::endl;
+  }
+skip_st_demo:
 
   std::string vocab_path = "assert/vocab.json";
   std::string merges_path = "assert/merges.txt";
