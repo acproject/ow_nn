@@ -300,6 +300,64 @@ public:
   // -------------------------- blocked, cache-friendly mulithreaded matmul
   // --------- implement a simple blocking algorithm with outer parallelism over
   // blocks of rows of A.
+  #include <immintrin.h>
+  // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous vectors of width W
+  static inline void ow_pack_B_panel(const TensorPtr &B, int j0, int j1,
+                                     int p0, int p1, int W,
+                                     std::vector<float> &pack) {
+    int k_len = p1 - p0;
+    pack.resize(k_len * W);
+    int n = B->shape[1];
+    for (int p = 0; p < k_len; ++p) {
+      int src_p = p0 + p;
+      for (int l = 0; l < W; ++l) {
+        int j = j0 + l;
+        float bv = 0.0f;
+        if (j < j1) {
+          size_t bi = (size_t)src_p * n + j;
+          bv = B->get_as_float_flat(bi);
+        }
+        pack[p * W + l] = bv;
+      }
+    }
+  }
+
+#if defined(__AVX__)
+  // 8-wide AVX micro-kernel for one row
+  static inline void ow_microkernel_row_8_avx(const float *Arow_p0,
+                                              const float *packB,
+                                              int k_len, float *Rptr) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int p = 0; p < k_len; ++p) {
+      __m256 b = _mm256_loadu_ps(packB + p * 8);
+      __m256 a = _mm256_set1_ps(Arow_p0[p]);
+#if defined(__FMA__)
+      acc = _mm256_fmadd_ps(a, b, acc);
+#else
+      acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
+#endif
+    }
+    __m256 prev = _mm256_loadu_ps(Rptr);
+    prev = _mm256_add_ps(prev, acc);
+    _mm256_storeu_ps(Rptr, prev);
+  }
+#endif
+
+  // 4-wide SSE micro-kernel for one row
+  static inline void ow_microkernel_row_4_sse(const float *Arow_p0,
+                                              const float *packB, int k_len,
+                                              float *Rptr) {
+    __m128 acc = _mm_setzero_ps();
+    for (int p = 0; p < k_len; ++p) {
+      __m128 b = _mm_loadu_ps(packB + p * 4);
+      __m128 a = _mm_set1_ps(Arow_p0[p]);
+      acc = _mm_add_ps(acc, _mm_mul_ps(a, b));
+    }
+    __m128 prev = _mm_loadu_ps(Rptr);
+    prev = _mm_add_ps(prev, acc);
+    _mm_storeu_ps(Rptr, prev);
+  }
+
   static TensorPtr matmul_blocked_mt(const TensorPtr &A, const TensorPtr &B,
                                      size_t block_m = 64, size_t block_n = 64,
                                      size_t block_k = 64, size_t nthreads = 0) {
@@ -316,12 +374,22 @@ public:
     if (!ctx)
       throw std::runtime_error("ctx expired");
     auto R = Tensor::create(ctx, {m, n}, DType::FLOAT32);
-    // Extract raw pointers for float-able access via
-    // get_as_float_flat/set_from_float_flat
+
     if (nthreads == 0)
       nthreads = std::max<size_t>(1, std::thread::hardware_concurrency());
     ThreadPool tp(nthreads);
-    // partition i (rows) into tasks per block
+
+#if defined(__AVX__)
+    const int W = 8;
+#else
+    const int W = 4;
+#endif
+
+    const bool fastA = (A->dtype == DType::FLOAT32);
+    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data)
+                               : nullptr;
+    float *Rdata = reinterpret_cast<float *>(R->data);
+
     std::vector<std::future<void>> futs;
     for (int i0 = 0; i0 < m; i0 += (int)block_m) {
       int i1 = std::min(m, i0 + (int)block_m);
@@ -330,32 +398,46 @@ public:
           int j1 = std::min(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
             int p1 = std::min(k, p0 + (int)block_k);
-            // compute blcok C[i0:i1, j0:j1] += A[i0:i1, p0:p1] * B[p0:p1,
-            // j0:j1]
-            for (int ii = i0; ii < i1; ++ii) {
-              for (int jj = j0; jj < j1; ++jj) {
-                float acc = 0.0f;
-                // if p0==0 and p1==k and ii==i0 and jj=j0 maybe can read
-                // previous value; but accumulate
-                for (int pp = p0; pp < p1; ++pp) {
-                  size_t ai = (size_t)ii * k + pp;
-                  size_t bi = (size_t)pp * n + jj;
-                  float av = A->get_as_float_flat(ai);
-                  float bv = B->get_as_float_flat(bi);
-                  acc += av * bv;
+            for (int jpanel = j0; jpanel < j1; jpanel += W) {
+              int jend = std::min(j1, jpanel + W);
+              std::vector<float> pack;
+              ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+              int k_len = p1 - p0;
+              for (int ii = i0; ii < i1; ++ii) {
+                const float *Arow = fastA ? (Adata + ii * k + p0) : nullptr;
+                float *Rptr = Rdata + (size_t)ii * n + jpanel;
+#if defined(__AVX__)
+                if (jend - jpanel == 8 && Arow) {
+                  ow_microkernel_row_8_avx(Arow, pack.data(), k_len, Rptr);
+                  continue;
                 }
-
-                // accumulate into R (read previous and add)
-                size_t ri = (size_t)ii * n + jj;
-                float prev = R->get_as_float_flat(ri);
-                R->set_from_float_flat(ri, prev + acc);
+#endif
+                if (jend - jpanel == 4 && Arow) {
+                  ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr);
+                  continue;
+                }
+                // fallback scalar for leftover columns or non-FLOAT32 A
+                int width = jend - jpanel;
+                std::vector<float> acc(width, 0.0f);
+                for (int p = 0; p < k_len; ++p) {
+                  float a = fastA ? Arow[p] :
+                                   A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  const float *bvec = pack.data() + p * W;
+                  for (int l = 0; l < width; ++l) {
+                    acc[l] += a * bvec[l];
+                  }
+                }
+                for (int l = 0; l < width; ++l) {
+                  size_t ri = (size_t)ii * n + (jpanel + l);
+                  float prev = R->get_as_float_flat(ri);
+                  R->set_from_float_flat(ri, prev + acc[l]);
+                }
               }
             }
           }
         }
       }));
     }
-    // wait
     for (auto &f : futs)
       f.get();
     return R;

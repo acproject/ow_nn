@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
 
 void fill_tensor_from_vector(const ow::nn::TensorPtr &T,
                              const std::vector<float> &vals) {
@@ -48,6 +49,54 @@ int main(int argc, char **argv) {
   }
   std::cout << " \n";
 
+  // quick numeric check vs naive reference
+  auto Rref = ow::nn::Tensor::create(ctx, {M, N}, ow::nn::DType::FLOAT32);
+  for (int i = 0; i < M; ++i) {
+    for (int j = 0; j < N; ++j) {
+      float acc = 0.f;
+      for (int p = 0; p < K; ++p) {
+        acc += A->get_as_float_flat((size_t)i * K + p) *
+               B->get_as_float_flat((size_t)p * N + j);
+      }
+      Rref->set_from_float_flat((size_t)i * N + j, acc);
+    }
+  }
+  double max_abs_err = 0.0;
+  for (size_t idx = 0; idx < R->nelements(); ++idx) {
+    double e = std::abs(R->get_as_float_flat(idx) - Rref->get_as_float_flat(idx));
+    if (e > max_abs_err) max_abs_err = e;
+  }
+  std::cout << "Matmul max_abs_err vs ref: " << max_abs_err << "\n";
+
+  // benchmarking optimized matmul (non-interactive)
+  auto bench = [](int M, int K, int N, int repeats) {
+    auto ctxb = std::make_shared<ow::nn::Context>(64 * 1024 * 1024);
+    auto A = ow::nn::Tensor::create(ctxb, {M, K}, ow::nn::DType::FLOAT32);
+    auto B = ow::nn::Tensor::create(ctxb, {K, N}, ow::nn::DType::FP16);
+    std::vector<float> avals((size_t)M * K), bvals((size_t)K * N);
+    for (size_t i = 0; i < avals.size(); ++i)
+      avals[i] = float((i % 7) - 3) * 0.01f + 0.5f;
+    for (size_t i = 0; i < bvals.size(); ++i)
+      bvals[i] = float((i % 11) - 5) * 0.02f + 1.0f;
+    fill_tensor_from_vector(A, avals);
+    fill_tensor_from_vector(B, bvals);
+
+    double total_ms = 0.0;
+    for (int r = 0; r < repeats; ++r) {
+      auto t0 = std::chrono::high_resolution_clock::now();
+      auto Ropt = ow::nn::Tensor::matmul_blocked_mt(
+          A, B, 64, 64, 128, std::thread::hardware_concurrency());
+      auto t1 = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::milli> dt = t1 - t0;
+      total_ms += dt.count();
+      (void)Ropt;
+    }
+    std::cout << "Benchmark M=" << M << " K=" << K << " N=" << N
+              << ": avg " << (total_ms / repeats) << " ms" << std::endl;
+  };
+  // run a couple of sizes; keep repeats small to avoid long runtime
+  bench(512, 512, 512, 3);
+  bench(1024, 1024, 1024, 2);
   // quantize example: int8
   auto C_int8 = ow::nn::Tensor::create(ctx, {M, K}, ow::nn::DType::INT8);
   ow::nn::Tensor::quantize_int8_from_floats(C_int8, avals);

@@ -16,11 +16,11 @@ FetchContent_MakeAvailable(json)
 
 # 编译选项
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    add_compile_options(-Wall -Wextra -O2)
+    add_compile_options(-Wall -Wextra -O2 -mavx2 -mfma)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    add_compile_options(/W4 /O2)
+    add_compile_options(/W4 /O2 /arch:AVX2)
 endif()
 
 # 包含目录
