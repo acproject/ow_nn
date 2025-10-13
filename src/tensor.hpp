@@ -2,13 +2,12 @@
 #include "../include/common.h"
 #include "context.hpp"
 #include "thread_pool.hpp"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <algorithm>
-#include <thread>
 #include <functional>
 #include <future>
 #include <iomanip>
@@ -17,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // 前缀声明，用于定义下面的智能指针
@@ -40,12 +40,18 @@ struct Tensor : public std::enable_shared_from_this<Tensor> {
     strides = calc_strides(shape);
   }
 
+  // 根据给定的 shape 计算张量的 strides（步长）。
+  // 结果 strides[i] 表示：沿着第 i
+  // 维移动一个元素，在底层一维内存中需要跳过多少个元素。
+  // 采用行主序（row-major）规则，即从最后一维开始反向累乘。
+  // 示例：shape = {2, 3, 4}，则返回 strides = {12, 4, 1}。
   static std::vector<int> calc_strides(const std::vector<int> &shape) {
     std::vector<int> s(shape.size());
     int acc = 1;
+    // 从最后一维开始反向遍历，逐步累乘
     for (int i = (int)shape.size() - 1; i >= 0; --i) {
-      s[i] = acc;
-      acc *= shape[i];
+      s[i] = acc;      // 当前维的步长 = 之前所有维长度的乘积
+      acc *= shape[i]; // 更新累乘值，供前一维使用
     }
     return s;
   }
@@ -420,7 +426,7 @@ public:
                   continue;
                 }
 #endif
-                
+
 #if defined(__SSE__)
                 if (jend - jpanel == 4 && Arow) {
                   ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr);
