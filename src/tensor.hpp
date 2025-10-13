@@ -3,9 +3,13 @@
 #include "context.hpp"
 #include "thread_pool.hpp"
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <thread>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <ios>
@@ -14,7 +18,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <cmath>
 
 // 前缀声明，用于定义下面的智能指针
 namespace ow::nn {
@@ -144,6 +147,7 @@ public:
                  const std::vector<int> &new_strides, size_t offset_bytes = 0) {
     auto self = shared_from_this();
     Tensor *raw_view = new Tensor(dtype, new_shape);
+    raw_view->strides = new_strides;
     raw_view->data = static_cast<uint8_t *>(data) + offset_bytes;
     raw_view->ctx = ctx;
     // share same lifetime as self
@@ -297,14 +301,16 @@ public:
     std::cout << "\n";
   }
 
-  // -------------------------- blocked, cache-friendly mulithreaded matmul
-  // --------- implement a simple blocking algorithm with outer parallelism over
-  // blocks of rows of A.
-  #include <immintrin.h>
-  // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous vectors of width W
-  static inline void ow_pack_B_panel(const TensorPtr &B, int j0, int j1,
-                                     int p0, int p1, int W,
-                                     std::vector<float> &pack) {
+// -------------------------- blocked, cache-friendly mulithreaded matmul
+// --------- implement a simple blocking algorithm with outer parallelism over
+// blocks of rows of A.
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+  // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous vectors of
+  // width W
+  static inline void ow_pack_B_panel(const TensorPtr &B, int j0, int j1, int p0,
+                                     int p1, int W, std::vector<float> &pack) {
     int k_len = p1 - p0;
     pack.resize(k_len * W);
     int n = B->shape[1];
@@ -325,8 +331,8 @@ public:
 #if defined(__AVX__)
   // 8-wide AVX micro-kernel for one row
   static inline void ow_microkernel_row_8_avx(const float *Arow_p0,
-                                              const float *packB,
-                                              int k_len, float *Rptr) {
+                                              const float *packB, int k_len,
+                                              float *Rptr) {
     __m256 acc = _mm256_setzero_ps();
     for (int p = 0; p < k_len; ++p) {
       __m256 b = _mm256_loadu_ps(packB + p * 8);
@@ -344,6 +350,7 @@ public:
 #endif
 
   // 4-wide SSE micro-kernel for one row
+#if defined(__SSE__)
   static inline void ow_microkernel_row_4_sse(const float *Arow_p0,
                                               const float *packB, int k_len,
                                               float *Rptr) {
@@ -357,6 +364,7 @@ public:
     prev = _mm_add_ps(prev, acc);
     _mm_storeu_ps(Rptr, prev);
   }
+#endif
 
   static TensorPtr matmul_blocked_mt(const TensorPtr &A, const TensorPtr &B,
                                      size_t block_m = 64, size_t block_n = 64,
@@ -386,14 +394,14 @@ public:
 #endif
 
     const bool fastA = (A->dtype == DType::FLOAT32);
-    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data)
-                               : nullptr;
+    const float *Adata =
+        fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
     float *Rdata = reinterpret_cast<float *>(R->data);
 
     std::vector<std::future<void>> futs;
     for (int i0 = 0; i0 < m; i0 += (int)block_m) {
       int i1 = std::min(m, i0 + (int)block_m);
-      futs.emplace_back(tp.submit([=, &A, &B, &R](void) -> void {
+      futs.emplace_back(tp.submit([=, &A, &B, &R]() {
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
           int j1 = std::min(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
@@ -412,16 +420,20 @@ public:
                   continue;
                 }
 #endif
+                
+#if defined(__SSE__)
                 if (jend - jpanel == 4 && Arow) {
                   ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr);
                   continue;
                 }
+#endif
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
                 std::vector<float> acc(width, 0.0f);
                 for (int p = 0; p < k_len; ++p) {
-                  float a = fastA ? Arow[p] :
-                                   A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  float a = fastA
+                                ? Arow[p]
+                                : A->get_as_float_flat((size_t)ii * k + p0 + p);
                   const float *bvec = pack.data() + p * W;
                   for (int l = 0; l < width; ++l) {
                     acc[l] += a * bvec[l];
