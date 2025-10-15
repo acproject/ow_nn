@@ -27,6 +27,13 @@ struct QuantParams {
   float scale = 1.0f;
 };
 
+// 轻量描述信息，用于图的形状与类型推断
+struct TensorDesc {
+  DType dtype;
+  std::vector<int> shape;
+  std::vector<int> strides;
+};
+
 struct Tensor : public std::enable_shared_from_this<Tensor> {
   DType dtype;
   std::vector<int> shape;
@@ -71,6 +78,9 @@ public:
       return (nelements() + 1) / 2;
     return nelements() * dtype_size(dtype);
   }
+
+  // 获取描述信息
+  TensorDesc desc() const { return TensorDesc{dtype, shape, strides}; }
 
   // Create tensor backed by Context arena
   static TensorPtr create(const std::shared_ptr<Context> &ctx,
@@ -158,6 +168,29 @@ public:
     raw_view->ctx = ctx;
     // share same lifetime as self
     return TensorPtr(self, raw_view);
+  }
+
+  // 创建一个复制副本（保持 dtype 与布局），数据拷贝
+  TensorPtr copy() const {
+    auto c = ctx.lock();
+    if (!c) throw std::runtime_error("ctx expired");
+    auto out = Tensor::create(c, shape, dtype);
+    std::memcpy(out->data, data, nbytes());
+    return out;
+  }
+
+  // 转换 dtype，逐元素转换
+  TensorPtr astype(DType new_dtype) const {
+    if (new_dtype == dtype) return copy();
+    auto c = ctx.lock();
+    if (!c) throw std::runtime_error("ctx expired");
+    auto out = Tensor::create(c, shape, new_dtype);
+    size_t n = nelements();
+    for (size_t i = 0; i < n; ++i) {
+      float v = get_as_float_flat(i);
+      out->set_from_float_flat(i, v);
+    }
+    return out;
   }
 
   // 以 float& 形式返回第 idx 个元素，仅当 dtype 为 FLOAT32 时可用
@@ -260,6 +293,39 @@ public:
         old = (old & 0xF0) | (uq & 0x0F);
       p[byte_idx] = old;
       return;
+    }
+  }
+
+  // ----------------------- broadcasting helpers -----------------------
+  static std::vector<int> broadcast_shape(const std::vector<int>& a,
+                                          const std::vector<int>& b) {
+    size_t ra = a.size(), rb = b.size();
+    size_t r = std::max(ra, rb);
+    std::vector<int> out(r, 1);
+    for (size_t i = 0; i < r; ++i) {
+      int ad = (i < r - ra) ? 1 : a[i - (r - ra)];
+      int bd = (i < r - rb) ? 1 : b[i - (r - rb)];
+      if (ad != bd && ad != 1 && bd != 1)
+        throw std::runtime_error("broadcast: incompatible dims");
+      out[i] = std::max(ad, bd);
+    }
+    return out;
+  }
+
+  static size_t linear_index(const std::vector<int>& shape,
+                             const std::vector<int>& idx) {
+    size_t r = shape.size();
+    size_t off = 0;
+    for (size_t i = 0; i < r; ++i) off = off * (size_t)shape[i] + (size_t)idx[i];
+    return off;
+  }
+
+  static void next_index(std::vector<int>& idx,
+                         const std::vector<int>& shape) {
+    for (int i = (int)shape.size() - 1; i >= 0; --i) {
+      idx[i]++;
+      if (idx[i] < shape[i]) return;
+      idx[i] = 0;
     }
   }
 
@@ -465,17 +531,35 @@ public:
   // ---------------------------
   TensorPtr elementwise_binary(const TensorPtr &A, const TensorPtr &B,
                                const std::function<float(float, float)> &op) {
-    if (A->shape != B->shape)
-      throw std::runtime_error("shape mismatch");
+    // 支持广播规则（尾维对齐，维度为1可扩展）
     auto ctx = A->ctx.lock();
-    if (!ctx)
-      throw std::runtime_error("ctx expired");
-    auto R = Tensor::create(ctx, A->shape, DType::FLOAT32);
-    size_t n = A->nelements();
-    for (size_t i = 0; i < n; ++i) {
-      float a = A->get_as_float_flat(i);
-      float b = B->get_as_float_flat(i);
-      R->set_from_float_flat(i, op(a, b));
+    if (!ctx) throw std::runtime_error("ctx expired");
+    auto out_shape = broadcast_shape(A->shape, B->shape);
+    auto R = Tensor::create(ctx, out_shape, DType::FLOAT32);
+    std::vector<int> idx(out_shape.size(), 0);
+    size_t total = 1; for (int d: out_shape) total *= (size_t)d;
+    for (size_t t = 0; t < total; ++t) {
+      // map output idx to A/B idx
+      std::vector<int> ia(A->shape.size(), 0), ib(B->shape.size(), 0);
+      // align right (like numpy)
+      size_t ra = A->shape.size(), rb = B->shape.size();
+      for (size_t i = 0; i < out_shape.size(); ++i) {
+        int coord = idx[i];
+        if (i >= out_shape.size() - ra) {
+          int ad = A->shape[i - (out_shape.size() - ra)];
+          ia[i - (out_shape.size() - ra)] = (ad == 1) ? 0 : coord;
+        }
+        if (i >= out_shape.size() - rb) {
+          int bd = B->shape[i - (out_shape.size() - rb)];
+          ib[i - (out_shape.size() - rb)] = (bd == 1) ? 0 : coord;
+        }
+      }
+      size_t la = linear_index(A->shape, ia);
+      size_t lb = linear_index(B->shape, ib);
+      float a = A->get_as_float_flat(la);
+      float b = B->get_as_float_flat(lb);
+      R->set_from_float_flat(t, op(a, b));
+      next_index(idx, out_shape);
     }
     return R;
   }
@@ -490,6 +574,120 @@ public:
 
   TensorPtr tensor_mul(const TensorPtr &A, const TensorPtr &B) {
     return elementwise_binary(A, B, [](float a, float b) { return a * b; });
+  }
+
+  // 一元逐元素操作（示例：ReLU/GELU 需在后续扩展，这里先提供通用接口）
+  TensorPtr elementwise_unary(const TensorPtr &A,
+                              const std::function<float(float)> &op) {
+    auto ctx = A->ctx.lock();
+    if (!ctx) throw std::runtime_error("ctx expired");
+    auto R = Tensor::create(ctx, A->shape, DType::FLOAT32);
+    size_t n = A->nelements();
+    for (size_t i = 0; i < n; ++i) {
+      float a = A->get_as_float_flat(i);
+      R->set_from_float_flat(i, op(a));
+    }
+    return R;
+  }
+
+  // Specialized Conv3d for Qwen-VL patch embedding
+  // in_channels=3 -> out_channels=1280
+  // kernel=(2,14,14), stride=(2,14,14), bias=False
+  // Input X shape: {C=3, D, H, W}; Weight W: {Cout=1280, Cin=3, Kd=2, Kh=14, Kw=14}
+  // Output: {Cout, D_out=D/2, H_out=H/14, W_out=W/14}
+  static TensorPtr conv3d_k21414_s21414(const TensorPtr &X,
+                                        const TensorPtr &W) {
+    if (!X || !W)
+      throw std::runtime_error("Conv3d: input or weight is null");
+    auto ctx = X->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("Conv3d: context expired");
+    if (X->shape.size() != 4)
+      throw std::runtime_error("Conv3d: X must be 4D {C,D,H,W}");
+    if (W->shape.size() != 5)
+      throw std::runtime_error("Conv3d: W must be 5D {Cout,Cin,Kd,Kh,Kw}");
+    const int Cin = X->shape[0];
+    const int D = X->shape[1];
+    const int H = X->shape[2];
+    const int Ww = X->shape[3];
+    const int Cout = W->shape[0];
+    const int Win = W->shape[1];
+    const int Kd = W->shape[2];
+    const int Kh = W->shape[3];
+    const int Kw = W->shape[4];
+    if (Cin != 3 || Win != 3 || Cout != 1280 || Kd != 2 || Kh != 14 || Kw != 14)
+      throw std::runtime_error(
+          "Conv3d: shape mismatch, expected Cin=3,Cout=1280,K=(2,14,14)");
+    if ((D % Kd) != 0 || (H % Kh) != 0 || (Ww % Kw) != 0)
+      throw std::runtime_error(
+          "Conv3d: input dims must be divisible by kernel dims");
+    const int Dout = D / Kd;
+    const int Hout = H / Kh;
+    const int Wout = Ww / Kw;
+    TensorPtr Y = Tensor::create(ctx, {Cout, Dout, Hout, Wout}, DType::FLOAT32);
+    for (int oc = 0; oc < Cout; ++oc) {
+      for (int od = 0; od < Dout; ++od) {
+        const int d0 = od * Kd;
+        for (int oh = 0; oh < Hout; ++oh) {
+          const int h0 = oh * Kh;
+          for (int ow = 0; ow < Wout; ++ow) {
+            const int w0 = ow * Kw;
+            double acc = 0.0;
+            for (int c = 0; c < Cin; ++c) {
+              for (int kd = 0; kd < Kd; ++kd) {
+                for (int kh = 0; kh < Kh; ++kh) {
+                  for (int kw = 0; kw < Kw; ++kw) {
+                    size_t xi = (size_t)((((c * D) + (d0 + kd)) * H +
+                                          (h0 + kh)) * Ww + (w0 + kw));
+                    size_t wi = (size_t)(((((oc * Cin) + c) * Kd + kd) * Kh +
+                                          kh) * Kw + kw);
+                    float xv = X->get_as_float_flat(xi);
+                    float wv = W->get_as_float_flat(wi);
+                    acc += (double)xv * (double)wv;
+                  }
+                }
+              }
+            }
+            size_t yi = (size_t)((((oc * Dout) + od) * Hout + oh) * Wout + ow);
+            Y->set_from_float_flat(yi, (float)acc);
+          }
+        }
+      }
+    }
+    return Y;
+  }
+
+  // Flatten Conv3d output {Cout, Dout, Hout, Wout} into tokens {Ntoks, Cout}
+  static TensorPtr flatten_conv3d_tokens(const TensorPtr &Y) {
+    if (!Y)
+      throw std::runtime_error("flatten_conv3d_tokens: Y is null");
+    auto ctx = Y->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("flatten_conv3d_tokens: context expired");
+    if (Y->shape.size() != 4)
+      throw std::runtime_error(
+          "flatten_conv3d_tokens: Y must be 4D {Cout,Dout,Hout,Wout}");
+    const int Cout = Y->shape[0];
+    const int Dout = Y->shape[1];
+    const int Hout = Y->shape[2];
+    const int Wout = Y->shape[3];
+    const int Ntoks = Dout * Hout * Wout;
+    TensorPtr T = Tensor::create(ctx, {Ntoks, Cout}, DType::FLOAT32);
+    int t = 0;
+    for (int od = 0; od < Dout; ++od) {
+      for (int oh = 0; oh < Hout; ++oh) {
+        for (int ow = 0; ow < Wout; ++ow) {
+          for (int oc = 0; oc < Cout; ++oc) {
+            size_t yi = (size_t)((((oc * Dout) + od) * Hout + oh) * Wout + ow);
+            float v = Y->get_as_float_flat(yi);
+            size_t ti = (size_t)t * (size_t)Cout + (size_t)oc;
+            T->set_from_float_flat(ti, v);
+          }
+          ++t;
+        }
+      }
+    }
+    return T;
   }
 
 private:

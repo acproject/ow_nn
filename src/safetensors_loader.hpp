@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <limits>
+#include <cmath>
 #if __has_include(<nlohmann/json.hpp>)
 #include <nlohmann/json.hpp>
 #elif __has_include("../build/_deps/json-src/single_include/nlohmann/json.hpp")
@@ -37,6 +39,10 @@ static inline size_t st_dtype_size(const std::string &s) {
     return 2;
   if (s == "BF16")
     return 2;
+  if (s == "F8_E4M3")
+    return 1;
+  if (s == "F8_E5M2")
+    return 1;
   if (s == "F64")
     return 8;
   if (s == "I64")
@@ -191,6 +197,29 @@ struct SafetensorsLoader {
   std::unordered_map<std::string, std::pair<int, STEntry>>
       index; // name -> (file_id, entry)
 
+  // Access helpers
+  const STEntry *get_entry(const std::string &name) const {
+    auto it = index.find(name);
+    if (it == index.end())
+      return nullptr;
+    return &it->second.second;
+  }
+  static bool is_supported_dtype(const std::string &sd) {
+    return sd == "F32" || sd == "F16" || sd == "I32" || sd == "I8" ||
+           sd == "BF16" || sd == "F8_E4M3" || sd == "F8_E5M2" ||
+           sd == "U8" || sd == "BOOL" || sd == "I16" || sd == "I64" ||
+           sd == "F64";
+  }
+  std::vector<std::string> names_supported() const {
+    std::vector<std::string> out;
+    out.reserve(index.size());
+    for (auto &kv : index) {
+      if (is_supported_dtype(kv.second.second.st_dtype))
+        out.push_back(kv.first);
+    }
+    return out;
+  }
+
   void load_dir(const std::string &dir) {
     files.clear();
     index.clear();
@@ -293,6 +322,84 @@ struct SafetensorsLoader {
     }
   }
 
+  static inline void convert_u8_to_f32(const uint8_t *src_bytes, float *dst,
+                                       size_t n) {
+    for (size_t i = 0; i < n; ++i) dst[i] = float(src_bytes[i]);
+  }
+  static inline void convert_bool_to_f32(const uint8_t *src_bytes, float *dst,
+                                         size_t n) {
+    for (size_t i = 0; i < n; ++i) dst[i] = src_bytes[i] ? 1.0f : 0.0f;
+  }
+  static inline void convert_i16_to_i32(const uint8_t *src_bytes, int32_t *dst,
+                                        size_t n) {
+    const int16_t *s = reinterpret_cast<const int16_t *>(src_bytes);
+    for (size_t i = 0; i < n; ++i) dst[i] = (int32_t)s[i];
+  }
+  static inline void convert_i64_to_f32(const uint8_t *src_bytes, float *dst,
+                                        size_t n) {
+    const int64_t *s = reinterpret_cast<const int64_t *>(src_bytes);
+    for (size_t i = 0; i < n; ++i) dst[i] = float(s[i]);
+  }
+  static inline void convert_f64_to_f32(const uint8_t *src_bytes, float *dst,
+                                        size_t n) {
+    const double *s = reinterpret_cast<const double *>(src_bytes);
+    for (size_t i = 0; i < n; ++i) dst[i] = float(s[i]);
+  }
+
+  // FP8 E4M3: sign(1) exp(4, bias=7) mant(3). No Inf; exp=15 treated as NaN.
+  static inline void convert_fp8_e4m3_to_f32(const uint8_t *src_bytes, float *dst,
+                                             size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+      uint8_t b = src_bytes[i];
+      int sign = (b >> 7) & 0x1;
+      int exp = (b >> 3) & 0xF;
+      int mant = b & 0x7;
+      float s = sign ? -1.0f : 1.0f;
+      const int bias = 7;
+      float v;
+      if (exp == 0) {
+        // subnormal or zero
+        float m = mant / 8.0f;
+        v = std::ldexp(m, 1 - bias);
+      } else if (exp == 15) {
+        // Treat as NaN (E4M3 typically has no Inf)
+        v = std::numeric_limits<float>::quiet_NaN();
+      } else {
+        float m = 1.0f + mant / 8.0f;
+        v = std::ldexp(m, exp - bias);
+      }
+      dst[i] = s * v;
+    }
+  }
+
+  // FP8 E5M2: sign(1) exp(5, bias=15) mant(2). exp=31: Inf/NaN
+  static inline void convert_fp8_e5m2_to_f32(const uint8_t *src_bytes, float *dst,
+                                             size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+      uint8_t b = src_bytes[i];
+      int sign = (b >> 7) & 0x1;
+      int exp = (b >> 2) & 0x1F;
+      int mant = b & 0x3;
+      float s = sign ? -1.0f : 1.0f;
+      const int bias = 15;
+      float v;
+      if (exp == 0) {
+        float m = mant / 4.0f;
+        v = std::ldexp(m, 1 - bias);
+      } else if (exp == 31) {
+        if (mant == 0) {
+          v = std::numeric_limits<float>::infinity();
+        } else {
+          v = std::numeric_limits<float>::quiet_NaN();
+        }
+      } else {
+        float m = 1.0f + mant / 4.0f;
+        v = std::ldexp(m, exp - bias);
+      }
+      dst[i] = s * v;
+    }
+  }
+
   TensorPtr make_tensor(const std::string &name,
                         const std::shared_ptr<Context> &ctx,
                         bool copy = false) {
@@ -359,6 +466,41 @@ struct SafetensorsLoader {
       auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
       size_t n = T->nelements();
       convert_bf16_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "F8_E4M3") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_fp8_e4m3_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "F8_E5M2") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_fp8_e5m2_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "U8") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_u8_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "BOOL") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_bool_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "I16") {
+      auto T = Tensor::create(ctx, e.shape, DType::INT32);
+      size_t n = T->nelements();
+      convert_i16_to_i32(src, reinterpret_cast<int32_t *>(T->data), n);
+      return T;
+    } else if (sd == "I64") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_i64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      return T;
+    } else if (sd == "F64") {
+      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+      size_t n = T->nelements();
+      convert_f64_to_f32(src, reinterpret_cast<float *>(T->data), n);
       return T;
     } else {
       throw std::runtime_error("unsupported dtype for ow::nn:" + sd);
