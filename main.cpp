@@ -1,9 +1,15 @@
 // 简单入口程序，演示库初始化与版本信息
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
 #include "include/common.h"
 #include "include/ow_nn.h"
 #include "src/context.hpp"
 #include "src/tensor.hpp"
 #include "src/cgraph.hpp"
+#include "src/ops.hpp"
 #include "src/safetensors_loader.hpp"
 
 #include <cstddef>
@@ -209,9 +215,9 @@ static std::vector<float> resize_nearest_rgb(const std::vector<float> &src,
   float ry = float(H) / float(H2);
   float rx = float(W) / float(W2);
   for (int y2 = 0; y2 < H2; ++y2) {
-    int y = std::min(H - 1, int(y2 * ry));
+    int y = (std::min)(H - 1, int(y2 * ry));
     for (int x2 = 0; x2 < W2; ++x2) {
-      int x = std::min(W - 1, int(x2 * rx));
+    int x = (std::min)(W - 1, int(x2 * rx));
       for (int c = 0; c < 3; ++c) {
         size_t si = ((size_t)y * (size_t)W + (size_t)x) * 3 + (size_t)c;
         size_t di = ((size_t)y2 * (size_t)W2 + (size_t)x2) * 3 + (size_t)c;
@@ -349,6 +355,123 @@ int main(int argc, char **argv) {
   }
   std::cout << " \n";
 
+  // ---------------- Minimal runnable demo: Conv2d -> BatchNorm -> ReLU -> MaxPool -> Flatten -> Linear -> Softmax
+  auto demo_ctx = std::make_shared<ow::nn::Context>(128 * 1024 * 1024);
+  ow::nn::ComputeGraph g(demo_ctx);
+
+  // Prepare input X: [N=1, C=3, H=8, W=8]
+  auto X = ow::nn::Tensor::create(demo_ctx, {1, 3, 8, 8}, ow::nn::DType::FLOAT32);
+  for (size_t i = 0; i < X->nelements(); ++i) {
+    float v = float(int(i % 13) - 6) * 0.01f; // deterministic small values
+    X->set_from_float_flat(i, v);
+  }
+  g.add_input("x", X);
+
+  // Conv2d weights: [Cout=8, Cin=3, Kh=3, Kw=3]
+  auto W = ow::nn::Tensor::create(demo_ctx, {8, 3, 3, 3}, ow::nn::DType::FLOAT32);
+  for (size_t i = 0; i < W->nelements(); ++i) {
+    float v = float(int((i * 17) % 7) - 3) * 0.05f;
+    W->set_from_float_flat(i, v);
+  }
+  g.add_input("w", W);
+
+  // BatchNorm params (per-channel 8)
+  auto gamma = ow::nn::Tensor::create(demo_ctx, {8}, ow::nn::DType::FLOAT32);
+  auto beta  = ow::nn::Tensor::create(demo_ctx, {8}, ow::nn::DType::FLOAT32);
+  auto mean  = ow::nn::Tensor::create(demo_ctx, {8}, ow::nn::DType::FLOAT32);
+  auto var   = ow::nn::Tensor::create(demo_ctx, {8}, ow::nn::DType::FLOAT32);
+  for (int c = 0; c < 8; ++c) {
+    gamma->set_from_float_flat((size_t)c, 1.0f);
+    beta->set_from_float_flat((size_t)c, 0.0f);
+    mean->set_from_float_flat((size_t)c, 0.0f);
+    var->set_from_float_flat((size_t)c, 1.0f);
+  }
+  g.add_input("gamma", gamma);
+  g.add_input("beta",  beta);
+  g.add_input("mean",  mean);
+  g.add_input("var",   var);
+
+  // Nodes
+  auto n_conv = ow::nn::make_conv2d_node("x", "w", "conv");
+  n_conv.attrs["stride_h"] = "1";
+  n_conv.attrs["stride_w"] = "1";
+  n_conv.attrs["pad_h"]    = "1";
+  n_conv.attrs["pad_w"]    = "1";
+  g.add_node(n_conv);
+
+  auto n_bn = ow::nn::make_batch_norm_node("conv", "gamma", "beta", "mean", "var", "bn");
+  n_bn.attrs["eps"] = "1e-5";
+  g.add_node(n_bn);
+
+  auto n_relu = ow::nn::make_relu_node("bn", "relu");
+  g.add_node(n_relu);
+
+  auto n_pool = ow::nn::make_max_pool2d_node("relu", "pool");
+  n_pool.attrs["kernel_h"] = "2";
+  n_pool.attrs["kernel_w"] = "2";
+  n_pool.attrs["stride_h"] = "2";
+  n_pool.attrs["stride_w"] = "2";
+  g.add_node(n_pool);
+
+  auto n_flat = ow::nn::make_flatten_node("pool", "flat");
+  n_flat.attrs["start_axis"] = "1";
+  n_flat.attrs["end_axis"]   = "-1";
+  g.add_node(n_flat);
+
+  // Linear weights for flattened features: F = 8*4*4 = 128, classes = 10
+  auto Wlin = ow::nn::Tensor::create(demo_ctx, {128, 10}, ow::nn::DType::FLOAT32);
+  for (size_t i = 0; i < Wlin->nelements(); ++i) {
+    float v = float(int((i * 31) % 13) - 6) * 0.01f;
+    Wlin->set_from_float_flat(i, v);
+  }
+  g.add_input("W_lin", Wlin);
+
+  // Inline Linear (matmul) node: [1,F] @ [F,C] -> [1,C]
+  ow::nn::OpNode n_linear;
+  n_linear.name = "linear";
+  n_linear.inputs = {"flat", "W_lin"};
+  n_linear.output = "logits";
+  n_linear.fn = [](const std::vector<ow::nn::TensorPtr> &ins,
+                   const std::unordered_map<std::string, std::string> &) {
+    const auto &H = ins[0];
+    const auto &Wm = ins[1];
+    auto ctx = H->ctx.lock();
+    if (!ctx) throw std::runtime_error("linear: ctx expired");
+    if (H->shape.size() != 2 || H->shape[0] != 1)
+      throw std::runtime_error("linear: H must be [1,F]");
+    if (Wm->shape.size() != 2)
+      throw std::runtime_error("linear: W must be [F,C]");
+    int F = H->shape[1];
+    if (Wm->shape[0] != F)
+      throw std::runtime_error("linear: F mismatch");
+    auto R = ow::nn::Tensor::matmul_blocked_mt(H, Wm, 64, 64, 64, 1);
+    return R;
+  };
+  n_linear.infer = [](const std::vector<ow::nn::TensorDesc> &ids,
+                      const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("linear infer: need H and W");
+    const auto &Hd = ids[0];
+    const auto &Wd = ids[1];
+    return ow::nn::TensorDesc{ow::nn::DType::FLOAT32, {Hd.shape[0], Wd.shape[1]}};
+  };
+  g.add_node(n_linear);
+
+  auto n_sm = ow::nn::make_softmax_node("logits", "prob", -1);
+  g.add_node(n_sm);
+
+  // Execute graph
+  g.run();
+
+  auto P = g.get_tensor("prob");
+  std::cout << "Demo: prob shape=[";
+  for (size_t i = 0; i < P->shape.size(); ++i) {
+    std::cout << P->shape[i] << (i + 1 < P->shape.size() ? "," : "");
+  }
+  std::cout << "] first 10: ";
+  for (int i = 0; i < 10; ++i) std::cout << P->get_as_float_flat((size_t)i) << " ";
+  float sum = 0.0f; for (int i = 0; i < 10; ++i) sum += P->get_as_float_flat((size_t)i);
+  std::cout << "\nsoftmax sum (should≈1): " << sum << "\n";
+
   // quick numeric check vs naive reference
   auto Rref = ow::nn::Tensor::create(ctx, {M, N}, ow::nn::DType::FLOAT32);
   for (int i = 0; i < M; ++i) {
@@ -440,11 +563,11 @@ int main(int argc, char **argv) {
   // Simpler: demonstrate graph with a trivial add node
   // create two small tensors and run add via graph
 
-  auto X = ow::nn::Tensor::create(ctx, {4}, ow::nn::DType::FLOAT32);
-  fill_tensor_from_vector(X, {1, 2, 3, 4});
+  auto X2 = ow::nn::Tensor::create(ctx, {4}, ow::nn::DType::FLOAT32);
+  fill_tensor_from_vector(X2, {1, 2, 3, 4});
   auto Y = ow::nn::Tensor::create(ctx, {4}, ow::nn::DType::FLOAT32);
   fill_tensor_from_vector(Y, {0.5f, 0.5f, 0.5f, 0.5f});
-  graph.add_input("X", X);
+  graph.add_input("X", X2);
   graph.add_input("Y", Y);
   ow::nn::OpNode addn;
   addn.name = "add1";
@@ -543,7 +666,7 @@ int main(int argc, char **argv) {
       auto Wembed = loader.make_tensor(nm_embed, ctx, false);
       auto Wlm = loader.make_tensor(nm_lm, ctx, false);
 
-      ow::nn::ComputeGraph mgraph(ctx);
+      ow::nn::ComputeGraph mgraph{ctx};
       // 输入：token_ids（示例用单个 token 42）与权重
       auto token_ids = ow::nn::Tensor::create(ctx, {1}, ow::nn::DType::FLOAT32);
       token_ids->set_from_float_flat(0, 42.0f);
@@ -580,7 +703,8 @@ int main(int argc, char **argv) {
       if (mgraph.tensors.count("logits")) {
         auto L = mgraph.tensors["logits"];
         std::cout << "Forward logits sample[0..9]: ";
-        for (int i = 0; i < std::min<int>(10, L->shape[1]); ++i) {
+        int upto = L->shape[1] < 10 ? L->shape[1] : 10;
+        for (int i = 0; i < upto; ++i) {
           std::cout << L->get_as_float_flat(i) << " ";
         }
         std::cout << "\n";
@@ -710,69 +834,36 @@ int main(int argc, char **argv) {
         std::cout << "\n";
       }
 
-      ow::nn::ComputeGraph vgraph(ctx);
-      vgraph.add_input("image", Ximg);
-      vgraph.add_input("convW", Wconv);
-      vgraph.add_input("projW", Wproj);
-
-      // Conv3d node
-      ow::nn::OpNode nconv;
-      nconv.name = "conv3d_patch";
-      nconv.inputs = {"image", "convW"};
-      nconv.output = "Yconv";
-      nconv.fn = [](const std::vector<ow::nn::TensorPtr> &ins,
-                    const std::unordered_map<std::string, std::string> & /*attrs*/) {
-        return ow::nn::Tensor::conv3d_k21414_s21414(ins[0], ins[1]);
-      };
-      vgraph.add_node(nconv);
-
-      // Flatten tokens node
-      ow::nn::OpNode nft;
-      nft.name = "flatten_tokens";
-      nft.inputs = {"Yconv"};
-      nft.output = "visual_tokens1280";
-      nft.fn = [](const std::vector<ow::nn::TensorPtr> &ins,
-                  const std::unordered_map<std::string, std::string> & /*attrs*/) {
-        return ow::nn::Tensor::flatten_conv3d_tokens(ins[0]);
-      };
-      vgraph.add_node(nft);
-
-      // Vision projection node
-      ow::nn::OpNode nproj;
-      nproj.name = "vision_proj";
-      nproj.inputs = {"visual_tokens1280", "projW"};
-      nproj.output = "visual_tokens";
-      nproj.fn = [proj_transposed](const std::vector<ow::nn::TensorPtr> &ins,
-                                  const std::unordered_map<std::string, std::string> & /*attrs*/) {
-        return project_tokens_1280_to_embed(ins[0], ins[1], proj_transposed);
-      };
-      vgraph.add_node(nproj);
-
-      vgraph.run();
-      if (vgraph.tensors.count("Yconv")) {
-        auto YC = vgraph.tensors["Yconv"];
-        std::cout << "[Vision] Yconv sample[0..9]: ";
-        for (int i = 0; i < std::min<int>(10, YC->nelements()); ++i) {
-          std::cout << YC->get_as_float_flat(i) << " ";
+      // 直接执行视觉流程（避免 ComputeGraph 在 MSVC 下的解析问题）
+      auto Yconv = ow::nn::Tensor::conv3d_k21414_s21414(Ximg, Wconv);
+      std::cout << "[Vision] Yconv sample[0..9]: ";
+      {
+        int upto = (int)Yconv->nelements() < 10 ? (int)Yconv->nelements() : 10;
+        for (int i = 0; i < upto; ++i) {
+          std::cout << Yconv->get_as_float_flat(i) << " ";
         }
-        std::cout << "\n";
       }
-      if (vgraph.tensors.count("visual_tokens1280")) {
-        auto VT1280 = vgraph.tensors["visual_tokens1280"];
-        std::cout << "[Vision] tokens1280 shape=[" << VT1280->shape[0] << "," << VT1280->shape[1] << "] sample[0..9]: ";
-        for (int i = 0; i < std::min<int>(10, VT1280->shape[1]); ++i) {
+      std::cout << "\n";
+
+      auto VT1280 = ow::nn::Tensor::flatten_conv3d_tokens(Yconv);
+      std::cout << "[Vision] tokens1280 shape=[" << VT1280->shape[0] << "," << VT1280->shape[1] << "] sample[0..9]: ";
+      {
+        int upto = VT1280->shape[1] < 10 ? VT1280->shape[1] : 10;
+        for (int i = 0; i < upto; ++i) {
           std::cout << VT1280->get_as_float_flat(i) << " ";
         }
-        std::cout << "\n";
       }
-      if (vgraph.tensors.count("visual_tokens")) {
-        auto VT = vgraph.tensors["visual_tokens"];
-        std::cout << "[Vision] visual tokens shape=[" << VT->shape[0] << "," << VT->shape[1] << "] sample[0..9]: ";
-        for (int i = 0; i < std::min<int>(10, VT->shape[1]); ++i) {
+      std::cout << "\n";
+
+      auto VT = project_tokens_1280_to_embed(VT1280, Wproj, proj_transposed);
+      std::cout << "[Vision] visual tokens shape=[" << VT->shape[0] << "," << VT->shape[1] << "] sample[0..9]: ";
+      {
+        int upto = VT->shape[1] < 10 ? VT->shape[1] : 10;
+        for (int i = 0; i < upto; ++i) {
           std::cout << VT->get_as_float_flat(i) << " ";
         }
-        std::cout << "\n";
       }
+      std::cout << "\n";
     } else {
       std::cout << "Skip minimal forward graph due to missing embed/lm_head." << std::endl;
     }

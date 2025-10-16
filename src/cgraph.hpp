@@ -1,3 +1,4 @@
+#pragma once
 /// ------------------- compute graph ----------------------
 #include "context.hpp"
 #include "tensor.hpp"
@@ -41,6 +42,14 @@ struct ComputeGraph {
   }
 
   void add_node(const OpNode &n) { nodes.push_back(n); }
+  
+  TensorPtr get_tensor(const std::string &name) {
+    auto it = tensors.find(name);
+    if (it != tensors.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
   // simple topo: nodes as given; check dependencies and run ready nodes in
   // parallel
   void run() {

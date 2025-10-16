@@ -472,14 +472,14 @@ public:
 
     std::vector<std::future<void>> futs;
     for (int i0 = 0; i0 < m; i0 += (int)block_m) {
-      int i1 = std::min(m, i0 + (int)block_m);
+    int i1 = (std::min)(m, i0 + (int)block_m);
       futs.emplace_back(tp.submit([=, &A, &B, &R]() {
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
-          int j1 = std::min(n, j0 + (int)block_n);
+    int j1 = (std::min)(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
-            int p1 = std::min(k, p0 + (int)block_k);
+    int p1 = (std::min)(k, p0 + (int)block_k);
             for (int jpanel = j0; jpanel < j1; jpanel += W) {
-              int jend = std::min(j1, jpanel + W);
+    int jend = (std::min)(j1, jpanel + W);
               std::vector<float> pack;
               ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
               int k_len = p1 - p0;
