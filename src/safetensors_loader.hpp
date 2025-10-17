@@ -65,6 +65,8 @@ static inline DType st_to_dtype(const std::string &s) {
     return DType::FLOAT32;
   if (s == "F16")
     return DType::FP16;
+  if (s == "BF16")
+    return DType::BF16;
   if (s == "I32")
     return DType::INT32;
   if (s == "I8")
@@ -462,10 +464,16 @@ struct SafetensorsLoader {
       std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "BF16") {
-      // Convert to FLOAT32
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_bf16_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::BF16);
+        std::memcpy(T->data, src, e.nbytes);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::BF16, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F8_E4M3") {
       auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);

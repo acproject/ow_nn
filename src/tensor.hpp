@@ -229,6 +229,10 @@ public:
       const uint16_t *p = reinterpret_cast<const uint16_t *>(data);
       return fp16_to_float(p[index]);
     }
+    if (dtype == DType::BF16) {
+      const uint16_t *p = reinterpret_cast<const uint16_t *>(data);
+      return bf16_to_float(p[index]);
+    }
     if (dtype == DType::INT32) {
       const int32_t *p = reinterpret_cast<const int32_t *>(data);
       return float(p[index]);
@@ -259,6 +263,11 @@ public:
     if (dtype == DType::FP16) {
       uint16_t *p = reinterpret_cast<uint16_t *>(data);
       p[index] = float_to_fp16(v);
+      return;
+    }
+    if (dtype == DType::BF16) {
+      uint16_t *p = reinterpret_cast<uint16_t *>(data);
+      p[index] = float_to_bf16(v);
       return;
     }
     if (dtype == DType::INT32) {
@@ -425,10 +434,10 @@ public:
 #if defined(__SSE__)
   static inline void ow_microkernel_row_4_sse(const float *Arow_p0,
                                               const float *packB, int k_len,
-                                              float *Rptr) {
+                                              float *Rptr, int stride) {
     __m128 acc = _mm_setzero_ps();
     for (int p = 0; p < k_len; ++p) {
-      __m128 b = _mm_loadu_ps(packB + p * 4);
+      __m128 b = _mm_loadu_ps(packB + p * stride);
       __m128 a = _mm_set1_ps(Arow_p0[p]);
       acc = _mm_add_ps(acc, _mm_mul_ps(a, b));
     }
@@ -495,7 +504,7 @@ public:
 
 #if defined(__SSE__)
                 if (jend - jpanel == 4 && Arow) {
-                  ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr);
+                  ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr, W);
                   continue;
                 }
 #endif
@@ -524,6 +533,85 @@ public:
     }
     for (auto &f : futs)
       f.get();
+    return R;
+  }
+
+  // 专用 1xK · KxN 的并行 matvec（按列块并行），用于 LMHead 大词表场景
+  // A: [1, K], B: [K, N] -> R: [1, N]
+  static TensorPtr matvec_blocked_mt(const TensorPtr &A, const TensorPtr &B,
+                                     size_t block_n = 4096,
+                                     size_t block_k = 64,
+                                     size_t nthreads = 0) {
+    if (A->shape.size() != 2 || B->shape.size() != 2)
+      throw std::runtime_error("matvec: need 2D");
+    int m = A->shape[0];
+    int k = A->shape[1];
+    int kb = B->shape[0];
+    int n = B->shape[1];
+    if (m != 1) throw std::runtime_error("matvec expects A as [1,K]");
+    if (k != kb) throw std::runtime_error("matvec dim");
+
+    auto ctx = A->ctx.lock();
+    if (!ctx) throw std::runtime_error("ctx expired");
+    auto R = Tensor::create(ctx, {1, n}, DType::FLOAT32);
+
+    if (nthreads == 0)
+      nthreads = std::max<size_t>(1, std::thread::hardware_concurrency());
+    ThreadPool tp(nthreads);
+
+#if defined(__AVX__)
+    const int W = 8;
+#else
+    const int W = 4;
+#endif
+
+    const bool fastA = (A->dtype == DType::FLOAT32);
+    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
+    float *Rdata = reinterpret_cast<float *>(R->data);
+
+    // 初始化为 0（微核会做累加）
+    for (int j = 0; j < n; ++j) Rdata[j] = 0.0f;
+
+    std::vector<std::future<void>> futs;
+    for (int j0 = 0; j0 < n; j0 += (int)block_n) {
+      int j1 = (std::min)(n, j0 + (int)block_n);
+      futs.emplace_back(tp.submit([=, &A, &B]() {
+        for (int p0 = 0; p0 < k; p0 += (int)block_k) {
+          int p1 = (std::min)(k, p0 + (int)block_k);
+          const float *Arow_p0 = fastA ? (Adata + p0) : nullptr;
+          int k_len = p1 - p0;
+          for (int jpanel = j0; jpanel < j1; jpanel += W) {
+            int jend = (std::min)(j1, jpanel + W);
+            std::vector<float> pack;
+            ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+            float *Rptr = Rdata + jpanel;
+#if defined(__AVX__)
+            if (jend - jpanel == 8 && Arow_p0) {
+              ow_microkernel_row_8_avx(Arow_p0, pack.data(), k_len, Rptr);
+              continue;
+            }
+#endif
+#if defined(__SSE__)
+            if (jend - jpanel == 4 && Arow_p0) {
+              ow_microkernel_row_4_sse(Arow_p0, pack.data(), k_len, Rptr, W);
+              continue;
+            }
+#endif
+            // fallback: 标量累加
+            int width = jend - jpanel;
+            for (int p = 0; p < k_len; ++p) {
+              float a = fastA ? Arow_p0[p]
+                              : A->get_as_float_flat((size_t)p0 + p);
+              const float *bvec = pack.data() + p * W;
+              for (int l = 0; l < width; ++l) {
+                Rptr[l] += a * bvec[l];
+              }
+            }
+          }
+        }
+      }));
+    }
+    for (auto &f : futs) f.get();
     return R;
   }
 

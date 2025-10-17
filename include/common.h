@@ -5,18 +5,14 @@
 #include <cstring>
 #include <vector>
 namespace ow::nn {
-// 将输入值 x 向上对齐到 a 的整数倍
-// 参数:
-//   x - 需要对齐的原始值
-//   a - 对齐单位，必须是 2 的幂
-// 返回:
-//   大于等于 x 且为 a 的整数倍的最小值
+// Align x up to the nearest multiple of a (a must be power of two)
 static size_t align_up(size_t x, size_t a) { return (x + a - 1) & ~(a - 1); }
 
 enum class DType {
   FLOAT32,
   INT32,
   FP16,
+  BF16,
   INT8,
   Q4_0
 };
@@ -28,6 +24,8 @@ inline size_t dtype_size(DType t) {
   case DType::INT32:
     return 4;
   case DType::FP16:
+    return 2;
+  case DType::BF16:
     return 2;
   case DType::INT8:
     return 1;
@@ -93,5 +91,19 @@ static float fp16_to_float(uint16_t h) {
     float out;
     std::memcpy(&out, &f, 4);
     return out;
+}
+
+// bf16 helpers (use high 16 bits of IEEE754 float32)
+static uint16_t float_to_bf16(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return (uint16_t)(u >> 16);
+}
+
+static float bf16_to_float(uint16_t h) {
+  uint32_t u = ((uint32_t)h) << 16;
+  float out;
+  std::memcpy(&out, &u, 4);
+  return out;
 }
 } // namespace ow::nn

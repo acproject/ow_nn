@@ -2,6 +2,7 @@
 #include "../include/common.h"
 #include <cstddef>
 #include <memory>
+#include <iostream>
 
 namespace ow::nn {
 
@@ -20,6 +21,8 @@ public:
     size_t cur = align_up(offset, align_bytes);
     if (cur + bytes > arena.size()) {
       size_t new_size = std::max(arena.size() * 2, cur + bytes);
+      std::cout << "[Context] Resize arena from " << arena.size() << " to " << new_size
+                << " (need=" << (cur + bytes) << ")" << std::endl;
       arena.resize(new_size);
     }
     void *ptr = arena.data() + cur;

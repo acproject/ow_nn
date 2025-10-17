@@ -1,6 +1,7 @@
 # 核心库源文件
 set(SOURCES
     tokenizer.cpp
+    transformer.cpp
     context.hpp
     thread_pool.hpp
     tensor.hpp
