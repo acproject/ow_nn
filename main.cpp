@@ -21,6 +21,11 @@
 #include "include/tokenizer.h"
 #include <unordered_map>
 
+// Default asset and weight paths for local testing
+static const char* DEFAULT_WEIGHTS_DIR = "d:\\workspace\\cpp_projects\\ow_nn\\model";
+static const char* DEFAULT_VOCAB_PATH  = "d:\\workspace\\cpp_projects\\ow_nn\\model\\vocab.json";
+static const char* DEFAULT_MERGES_PATH = "d:\\workspace\\cpp_projects\\ow_nn\\model\\merges.txt";
+
 // -----------------------------------------------------------------------------
 // Helpers (phase 1)
 struct ModuleInfo {
@@ -149,9 +154,9 @@ static std::string normalize_weight_name(const std::string &name) {
 }
 
 int main(int argc, char **argv) {
-  std::string vocab_path = "assert/vocab.json"; 
-  std::string merges_path = "assert/merges.txt";
-  std::string weights_dir;
+  std::string vocab_path = DEFAULT_VOCAB_PATH; 
+  std::string merges_path = DEFAULT_MERGES_PATH;
+  std::string weights_dir = DEFAULT_WEIGHTS_DIR;
 
   if (argc >= 3) {
     vocab_path = argv[1];
@@ -261,7 +266,7 @@ int main(int argc, char **argv) {
   // MHA smoke test block to validate reshape/matmul order
   {
     using namespace ow::nn;
-    auto ctx = std::make_shared<Context>(4*1024*1024);
+    auto ctx = std::make_shared<Context>(16*1024*1024); // 16MB for test
     int hidden_size = 8;
     int num_heads = 2;
     int num_kv_heads = 1;
@@ -305,13 +310,13 @@ int main(int argc, char **argv) {
 
   // === Build model and run a short text generation with real weights ===
   try {
-    std::string model_dir = weights_dir.empty() ? std::string("model") : weights_dir;
+    std::string model_dir = weights_dir.empty() ? std::string(DEFAULT_WEIGHTS_DIR) : weights_dir;
     std::cout << "[GEN] Using model dir: " << model_dir << "\n";
 
     ow::nn::SafetensorsLoader gen_loader;
     gen_loader.load_dir(model_dir);
-    // Increase arena size to 4GB to accommodate large LM weights
-    auto gen_ctx = std::make_shared<ow::nn::Context>(4ull * 1024ull * 1024ull * 1024ull);
+    // Use 64MB initial arena size, will grow dynamically as needed
+    auto gen_ctx = std::make_shared<ow::nn::Context>(64ull * 1024ull * 1024ull);
 
     // Filter and load text-only weights to reduce memory usage
     std::unordered_map<std::string, ow::nn::TensorPtr> all_weights;
