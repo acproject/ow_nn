@@ -11,13 +11,15 @@
 #include <queue>
 #include <functional>
 #include <cctype>
-
-#include "include/ow_nn.h"
+#include <algorithm>
+ 
+ #include "include/ow_nn.h"
 #include "include/transformer.h"
 #include "src/safetensors_loader.hpp"
 #include "src/context.hpp"
 #include "src/tensor.hpp"
 #include "include/tokenizer.h"
+#include <unordered_map>
 
 // -----------------------------------------------------------------------------
 // Helpers (phase 1)
@@ -92,23 +94,58 @@ static bool is_low_precision_name_hint(const std::string &name) {
          (name.find("_scales") != std::string::npos);
 }
 
-static std::vector<int> topk_indices_from_logits(const ow::nn::TensorPtr &logits, int k) {
-  std::vector<int> result;
-  if (!logits) return result;
-  if (logits->shape.size() != 2 || logits->shape[0] != 1) return result;
-  int V = logits->shape[1];
-  if (k <= 0) return result;
-  if (k > V) k = V;
-  using Pair = std::pair<float,int>;
-  std::priority_queue<Pair, std::vector<Pair>, std::greater<Pair>> pq;
-  for (int i = 0; i < V; ++i) {
-    float v = logits->get_as_float_flat((size_t)i);
-    if ((int)pq.size() < k) pq.emplace(v, i);
-    else if (v > pq.top().first) { pq.pop(); pq.emplace(v, i); }
-  }
-  result.resize((size_t)k);
-  for (int i = k - 1; i >= 0; --i) { result[(size_t)i] = pq.top().second; pq.pop(); }
-  return result;
+// Helper: compute top-k indices from logits for debugging
+std::vector<std::pair<int, float>> topk_indices_from_logits(const ow::nn::TensorPtr &logits, int k) {
+    std::vector<std::pair<int, float>> topk;
+    int vocab = logits->shape[1];
+    for (int i = 0; i < vocab; ++i) {
+        float v = logits->get_as_float_flat(i);
+        if ((int)topk.size() < k) {
+            topk.emplace_back(i, v);
+            if ((int)topk.size() == k) {
+                std::sort(topk.begin(), topk.end(), [](auto &a, auto &b) { return a.second > b.second; });
+            }
+        } else if (v > topk.back().second) {
+            topk.back() = {i, v};
+            std::sort(topk.begin(), topk.end(), [](auto &a, auto &b) { return a.second > b.second; });
+        }
+    }
+    return topk;
+}
+
+// Row-oriented matvec: logits = hidden[1,K] dot each row of E[V,K] -> [1,V]
+static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const ow::nn::TensorPtr &E) {
+    using namespace ow::nn;
+    if (!hidden || !E) throw std::runtime_error("matvec_rows_dot: null tensor(s)");
+    if (hidden->shape.size() != 2 || E->shape.size() != 2) throw std::runtime_error("matvec_rows_dot: expect 2D tensors");
+    int K = hidden->shape[1];
+    int V = E->shape[0];
+    int Ek = E->shape[1];
+    if (K != Ek) throw std::runtime_error("matvec_rows_dot: inner dim mismatch");
+    auto ctx = hidden->ctx.lock();
+    if (!ctx) throw std::runtime_error("matvec_rows_dot: missing context");
+    auto out = ow::nn::Tensor::create(ctx, {1, V}, ow::nn::DType::FLOAT32);
+    // Compute logits row-by-row against embedding/lm_head rows
+    for (int j = 0; j < V; ++j) {
+        float acc = 0.0f;
+        size_t baseE = (size_t)j * (size_t)K;
+        for (int k = 0; k < K; ++k) {
+            float a = hidden->get_as_float_flat(k);
+            float b = E->get_as_float_flat(baseE + k);
+            acc += a * b;
+        }
+        out->set_from_float_flat(j, acc);
+    }
+    return out;
+}
+
+// Normalize weight names: strip 'model.language_model.' to 'model.' if present
+static std::string normalize_weight_name(const std::string &name) {
+    const std::string prefix = "model.language_model.";
+    if (name.rfind(prefix, 0) == 0) {
+        return std::string("model.") + name.substr(prefix.size());
+    }
+    return name;
 }
 
 int main(int argc, char **argv) {
@@ -265,5 +302,103 @@ int main(int argc, char **argv) {
     }
     std::cout << std::endl;
   }
+
+  // === Build model and run a short text generation with real weights ===
+  try {
+    std::string model_dir = weights_dir.empty() ? std::string("model") : weights_dir;
+    std::cout << "[GEN] Using model dir: " << model_dir << "\n";
+
+    ow::nn::SafetensorsLoader gen_loader;
+    gen_loader.load_dir(model_dir);
+    // Increase arena size to 4GB to accommodate large LM weights
+    auto gen_ctx = std::make_shared<ow::nn::Context>(4ull * 1024ull * 1024ull * 1024ull);
+
+    // Filter and load text-only weights to reduce memory usage
+    std::unordered_map<std::string, ow::nn::TensorPtr> all_weights;
+    for (const auto &name : gen_loader.names()) {
+        if (name.rfind("model.language_model.", 0) == 0 ||
+            name == "model.embed_tokens.weight" ||
+            name == "lm_head.weight" ||
+            name == "model.lm_head.weight") {
+            try {
+                auto t = gen_loader.make_tensor(name, gen_ctx, /*copy=*/false);
+                if (t) all_weights.emplace(name, t);
+            } catch (const std::exception &ex) {
+                std::cerr << "[Weight][skip] " << name << " due to: " << ex.what() << "\n";
+            }
+        }
+    }
+
+    ow::nn::WeightLoader wl;
+    for (const auto &kv : all_weights) {
+        wl.add_weight(normalize_weight_name(kv.first), kv.second);
+    }
+    auto model = wl.build_model();
+
+    // Prefer tokenizer in model dir, fallback to assets
+    std::string vocab_path_m = model_dir + "\\vocab.json";
+    std::string merges_path_m = model_dir + "\\merges.txt";
+    std::string vocab_path_final = vocab_path;
+    std::string merges_path_final = merges_path;
+    if (std::filesystem::exists(vocab_path_m) && std::filesystem::exists(merges_path_m)) {
+      vocab_path_final = vocab_path_m;
+      merges_path_final = merges_path_m;
+    }
+    ow::nn::Tokenizer tok(vocab_path_final, merges_path_final);
+
+    std::cout << "[Chat] Type your question. Use /exit to quit.\n";
+    std::vector<std::pair<std::string, std::string>> history;
+    while (true) {
+      std::string question;
+      std::cout << "Q> ";
+      if (!std::getline(std::cin, question)) break;
+      if (question == "/exit") break;
+      if (question.empty()) continue;
+
+      // Build simple Q&A-style prompt with minimal history
+      std::string prompt_text;
+      for (auto &turn : history) {
+        prompt_text += "User: " + turn.first + "\n";
+        prompt_text += "Assistant: " + turn.second + "\n";
+      }
+      prompt_text += "User: " + question + "\nAssistant: ";
+
+      auto ids = tok.encode(prompt_text);
+      int max_new_tokens = 64;
+      std::string answer;
+      for (int step = 0; step < max_new_tokens; ++step) {
+        auto hidden_states = model->forward(ids);
+        int seq_len2 = (int)ids.size();
+        int hidden_size2 = hidden_states->shape[1];
+        auto last_hidden = hidden_states->slice_view({seq_len2 - 1, 0}, {1, hidden_size2});
+
+        ow::nn::TensorPtr vocab_weight = wl.get_weight("lm_head.weight");
+        if (!vocab_weight) vocab_weight = wl.get_weight("model.lm_head.weight");
+        if (!vocab_weight) vocab_weight = wl.get_weight("model.embed_tokens.weight");
+        if (!vocab_weight) throw std::runtime_error("No vocab projection weight found");
+
+        auto logits = matvec_rows_dot(last_hidden, vocab_weight);
+        // Optional: print top-5 for debugging
+        auto top5 = topk_indices_from_logits(logits, 5);
+        std::cout << "[DBG top-5] ";
+        for (auto &p : top5) std::cout << "(" << p.first << ":" << p.second << ") ";
+        std::cout << "\n";
+
+        auto next = std::max_element(top5.begin(), top5.end(), [](auto &a, auto &b){return a.second < b.second;});
+        int next_id = next->first;
+        ids.push_back(next_id);
+        std::string piece = tok.decode({next_id});
+        std::cout << piece << std::flush;
+        answer += piece;
+
+        if (!piece.empty() && piece.back() == '\n') break;
+      }
+      std::cout << std::endl;
+      history.emplace_back(question, answer);
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "[GEN][Error] " << e.what() << "\n";
+  }
+
   return 0;
 }

@@ -409,6 +409,26 @@ public:
     }
   }
 
+  // Transposed pack helper: treat B with shape [n, k] as B^T when packing
+  static inline void ow_pack_B_panel_transposed(const TensorPtr &B, int j0, int j1, int p0,
+                                     int p1, int W, std::vector<float> &pack) {
+    int k_len = p1 - p0;
+    pack.resize(k_len * W);
+    int k = B->shape[1];
+    for (int p = 0; p < k_len; ++p) {
+      int src_p = p0 + p; // along original k dimension
+      for (int l = 0; l < W; ++l) {
+        int j = j0 + l;   // along original n dimension
+        float bv = 0.0f;
+        if (j < j1) {
+          size_t bi = (size_t)j * k + src_p; // index [j, src_p]
+          bv = B->get_as_float_flat(bi);
+        }
+        pack[p * W + l] = bv;
+      }
+    }
+  }
+
 #if defined(__AVX__)
   // 8-wide AVX micro-kernel for one row
   static inline void ow_microkernel_row_8_avx(const float *Arow_p0,
@@ -454,11 +474,13 @@ public:
       throw std::runtime_error("matmul: need 2D");
     int m = A->shape[0];
     int k = A->shape[1];
-    int kb = B->shape[0];
-    int n = B->shape[1];
 
-    if (k != kb)
+    bool B_is_k_by_n = (B->shape[0] == k);
+    bool B_is_n_by_k = (B->shape[1] == k);
+    if (!B_is_k_by_n && !B_is_n_by_k)
       throw std::runtime_error("matmul dim");
+    int n = B_is_k_by_n ? B->shape[1] : B->shape[0];
+
     auto ctx = A->ctx.lock();
     if (!ctx)
       throw std::runtime_error("ctx expired");
@@ -481,16 +503,20 @@ public:
 
     std::vector<std::future<void>> futs;
     for (int i0 = 0; i0 < m; i0 += (int)block_m) {
-    int i1 = (std::min)(m, i0 + (int)block_m);
+      int i1 = (std::min)(m, i0 + (int)block_m);
       futs.emplace_back(tp.submit([=, &A, &B, &R]() {
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
-    int j1 = (std::min)(n, j0 + (int)block_n);
+          int j1 = (std::min)(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
-    int p1 = (std::min)(k, p0 + (int)block_k);
+            int p1 = (std::min)(k, p0 + (int)block_k);
             for (int jpanel = j0; jpanel < j1; jpanel += W) {
-    int jend = (std::min)(j1, jpanel + W);
+              int jend = (std::min)(j1, jpanel + W);
               std::vector<float> pack;
-              ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+              if (B_is_k_by_n) {
+                ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+              } else {
+                ow_pack_B_panel_transposed(B, jpanel, jend, p0, p1, W, pack);
+              }
               int k_len = p1 - p0;
               for (int ii = i0; ii < i1; ++ii) {
                 const float *Arow = fastA ? (Adata + ii * k + p0) : nullptr;
@@ -501,7 +527,6 @@ public:
                   continue;
                 }
 #endif
-
 #if defined(__SSE__)
                 if (jend - jpanel == 4 && Arow) {
                   ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr, W);
@@ -546,10 +571,12 @@ public:
       throw std::runtime_error("matvec: need 2D");
     int m = A->shape[0];
     int k = A->shape[1];
-    int kb = B->shape[0];
-    int n = B->shape[1];
     if (m != 1) throw std::runtime_error("matvec expects A as [1,K]");
-    if (k != kb) throw std::runtime_error("matvec dim");
+
+    bool B_is_k_by_n = (B->shape[0] == k);
+    bool B_is_n_by_k = (B->shape[1] == k);
+    if (!B_is_k_by_n && !B_is_n_by_k) throw std::runtime_error("matvec dim");
+    int n = B_is_k_by_n ? B->shape[1] : B->shape[0];
 
     auto ctx = A->ctx.lock();
     if (!ctx) throw std::runtime_error("ctx expired");
@@ -583,7 +610,11 @@ public:
           for (int jpanel = j0; jpanel < j1; jpanel += W) {
             int jend = (std::min)(j1, jpanel + W);
             std::vector<float> pack;
-            ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+            if (B_is_k_by_n) {
+              ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+            } else {
+              ow_pack_B_panel_transposed(B, jpanel, jend, p0, p1, W, pack);
+            }
             float *Rptr = Rdata + jpanel;
 #if defined(__AVX__)
             if (jend - jpanel == 8 && Arow_p0) {

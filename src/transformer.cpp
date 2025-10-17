@@ -7,8 +7,8 @@
 
 namespace ow::nn {
 
-// Ensure a 2D linear weight has shape [in_dim, out_dim]. If it's loaded as
-// [out_dim, in_dim] (PyTorch default), perform a contiguous transpose copy.
+// Ensure a 2D linear weight has expected dims, but avoid copying.
+// If loaded as [out_dim, in_dim], leave it as-is; matmul handles transposed B.
 static TensorPtr ensure_linear_weight_or_transpose(const TensorPtr& W, int expected_in_dim, int expected_out_dim = -1) {
     if (!W) throw std::runtime_error("ensure_linear_weight_or_transpose: null weight");
     if (W->shape.size() != 2) return W; // Only handle 2D weights
@@ -17,23 +17,14 @@ static TensorPtr ensure_linear_weight_or_transpose(const TensorPtr& W, int expec
     bool ok_no_transpose = (r0 == expected_in_dim) && (expected_out_dim < 0 || r1 == expected_out_dim);
     if (ok_no_transpose) return W;
     bool can_transpose = (r1 == expected_in_dim) && (expected_out_dim < 0 || r0 == expected_out_dim);
-    if (!can_transpose) {
-        // Dimensions don't match expectations; return as-is and let call sites fail loudly.
-        return W;
+    if (can_transpose) {
+        std::cerr << "[Weight] Using transposed orientation without copy: expected ["
+                  << expected_in_dim << "," << (expected_out_dim<0? r0: expected_out_dim)
+                  << "] got [" << r0 << "," << r1 << "]" << std::endl;
+        return W; // rely on matmul auto-handling
     }
-    auto ctx = W->ctx.lock();
-    if (!ctx) throw std::runtime_error("ensure_linear_weight_or_transpose: ctx expired");
-    int out_dim = (expected_out_dim < 0) ? r0 : expected_out_dim;
-    auto T = Tensor::create(ctx, {expected_in_dim, out_dim}, DType::FLOAT32);
-    // Transpose copy
-    for (int i = 0; i < expected_in_dim; ++i) {
-        for (int j = 0; j < out_dim; ++j) {
-            // Read original [j, i]
-            float v = W->get_as_float_flat((size_t)j * r1 + i);
-            T->set_from_float_flat((size_t)i * out_dim + j, v);
-        }
-    }
-    return T;
+    // Dimensions don't match expectations; return as-is and let call sites fail loudly.
+    return W;
 }
 
 
@@ -524,8 +515,15 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
             continue;
         }
         auto gate_weight = ensure_linear_weight_or_transpose(gate_weight_raw, hidden_size);
-        // Derive expert count directly from fixed gate weight
-        int gate_num_experts = (gate_weight->shape.size() == 2) ? gate_weight->shape[1] : num_experts;
+        // Derive expert count robustly regardless of orientation
+        int gate_num_experts = num_experts;
+        if (gate_weight && gate_weight->shape.size() == 2) {
+            int s0 = gate_weight->shape[0];
+            int s1 = gate_weight->shape[1];
+            if (s0 == hidden_size && s1 != hidden_size) gate_num_experts = s1;
+            else if (s1 == hidden_size && s0 != hidden_size) gate_num_experts = s0;
+            else gate_num_experts = std::max(s0, s1);
+        }
         if (gate_num_experts <= 0) gate_num_experts = num_experts;
         
         // Build experts
