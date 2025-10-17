@@ -872,6 +872,204 @@ int main(int argc, char **argv) {
   }
 skip_st_demo:
 
+  // ---- ops.hpp sanity tests ----
+  try {
+    auto tctx = std::make_shared<ow::nn::Context>(32 * 1024 * 1024);
+    const float kTol = 1e-4f;
+    const float kTolLoose = 1e-3f;
+    auto mk = [](const std::vector<int> &shape, const std::vector<float> &vals, const std::shared_ptr<ow::nn::Context> &c){
+      auto T = ow::nn::Tensor::create(c, shape, ow::nn::DType::FLOAT32);
+      for(size_t i=0; i<vals.size(); ++i) T->set_from_float_flat(i, vals[i]);
+      return T;
+    };
+    auto almostTol = [&](float a, float b, float tol){return std::fabs(a-b) <= tol;};
+    int tests_run = 0, tests_failed = 0;
+    auto CHECK = [&](bool cond, const char* name){ ++tests_run; std::cout << "[ops] " << name << ": " << (cond?"PASS":"FAIL") << "\n"; if(!cond) ++tests_failed; };
+
+    // relu
+    auto Xr = mk({1,5}, {-2.f,-1.f,0.f,1.f,2.f}, tctx);
+    auto Yr = ow::nn::relu(Xr);
+    bool relu_ok = true;
+    std::vector<float> exp_r = {0.f,0.f,0.f,1.f,2.f};
+    for(size_t i=0;i<exp_r.size();++i){ if(!almostTol(Yr->get_as_float_flat(i), exp_r[i], kTol)) relu_ok=false; }
+    CHECK(relu_ok, "relu ok");
+
+    // sigmoid
+    auto Ys = ow::nn::sigmoid(Xr);
+    bool sigmoid_ok = true;
+    for(size_t i=0;i<exp_r.size();++i){
+      float v = 1.f/(1.f+std::exp(-((-2.f)+float(i))));
+      if(!almostTol(Ys->get_as_float_flat(i), v, kTol)) sigmoid_ok=false;
+    }
+    CHECK(sigmoid_ok, "sigmoid ok");
+
+    // tanh
+    auto Yt = ow::nn::tanh_act(Xr);
+    bool tanh_ok = true;
+    for(size_t i=0;i<exp_r.size();++i){
+      float v = std::tanh((-2.f)+float(i));
+      if(!almostTol(Yt->get_as_float_flat(i), v, kTol)) tanh_ok=false;
+    }
+    CHECK(tanh_ok, "tanh ok");
+
+    // gelu (approx)
+    auto Yg = ow::nn::gelu(Xr, true);
+    bool gelu_shape_ok = (Yg->shape == Xr->shape);
+    CHECK(gelu_shape_ok, "gelu shape ok");
+
+    // silu
+    auto Ysi = ow::nn::silu(Xr);
+    bool silu_ok = true;
+    for(size_t i=0;i<exp_r.size();++i){
+      float x = (-2.f)+float(i);
+      float v = x/(1.f+std::exp(-x));
+      if(!almostTol(Ysi->get_as_float_flat(i), v, kTol)) silu_ok=false;
+    }
+    CHECK(silu_ok, "silu ok");
+
+    // softmax over last axis
+    auto L = mk({2,3}, {0.f,1.f,2.f, 3.f,4.f,5.f}, tctx);
+    auto S = ow::nn::softmax(L, -1);
+    float s0=0.f, s1=0.f;
+    for(int j=0;j<3;++j){ s0 += S->get_as_float_flat(j); s1 += S->get_as_float_flat(3 + j); }
+    CHECK(almostTol(s0, 1.f, kTol) && almostTol(s1, 1.f, kTol), "softmax row sums ~1");
+
+    // dropout deterministic and eval scaling
+    auto Dsrc = mk({1,10}, std::vector<float>(10,1.f), tctx);
+    auto Deval = ow::nn::dropout(Dsrc, 0.25f, false, 123);
+    bool deval_ok = true;
+    for(size_t i=0;i<10;++i){
+      if(!almostTol(Deval->get_as_float_flat(i), 0.75f, kTol)) deval_ok=false;
+    }
+    CHECK(deval_ok, "dropout eval scaling ok");
+    auto Dtrain1 = ow::nn::dropout(Dsrc, 0.5f, true, 123);
+    auto Dtrain2 = ow::nn::dropout(Dsrc, 0.5f, true, 123);
+    bool dtrain_ok = true;
+    for(size_t i=0;i<10;++i){
+      if(!almostTol(Dtrain1->get_as_float_flat(i), Dtrain2->get_as_float_flat(i), kTol)) dtrain_ok=false;
+    }
+    CHECK(dtrain_ok, "dropout reproducible with same seed");
+
+    // residual_add
+    auto A1 = mk({2,3}, {1,2,3, 4,5,6}, tctx);
+    auto B1 = mk({2,3}, {10,20,30, 1,2,3}, tctx);
+    auto R1 = ow::nn::residual_add(A1, B1, 0.5f);
+    bool res_ok = true;
+    std::vector<float> exp_res = {1+5,2+10,3+15, 4+0.5f,5+1.f,6+1.5f};
+    for(size_t i=0;i<exp_res.size();++i){
+      if(!almostTol(R1->get_as_float_flat(i), exp_res[i], kTol)) res_ok=false;
+    }
+    CHECK(res_ok, "residual_add ok");
+
+    // conv2d simple NCHW
+    auto Xin = mk({1,1,3,3}, {1,2,3,4,5,6,7,8,9}, tctx);
+    auto Win = mk({1,1,3,3}, std::vector<float>(9,1.f), tctx);
+    auto Yc = ow::nn::conv2d(Xin, Win, nullptr, 1,1,0,0,1,1,1);
+    bool conv_ok = (Yc->shape == std::vector<int>{1,1,1,1}) && almostTol(Yc->get_as_float_flat(0), 45.f, kTol);
+    CHECK(conv_ok, "conv2d 3x3 sum ok");
+
+    // max_pool2d / avg_pool2d
+    auto Psrc = mk({1,1,2,4}, {1,2,3,4, 5,6,7,8}, tctx);
+    auto Pmax = ow::nn::max_pool2d(Psrc, 2,2, 2,2, 0,0, 1,1);
+    auto Pavg = ow::nn::avg_pool2d(Psrc, 2,2, 2,2, 0,0, 1,1);
+    bool pmax_ok = (Pmax->shape == std::vector<int>{1,1,1,2})
+                   && almostTol(Pmax->get_as_float_flat(0), 6.f, kTol)
+                   && almostTol(Pmax->get_as_float_flat(1), 8.f, kTol);
+    bool pavg_ok = (Pavg->shape == std::vector<int>{1,1,1,2})
+                   && almostTol(Pavg->get_as_float_flat(0), 3.5f, kTol)
+                   && almostTol(Pavg->get_as_float_flat(1), 5.5f, kTol);
+    CHECK(pmax_ok, "max_pool2d ok");
+    CHECK(pavg_ok, "avg_pool2d ok");
+
+    // flatten
+    auto Fsrc = mk({1,2,3}, {0,1,2,3,4,5}, tctx);
+    auto Fdst = ow::nn::flatten(Fsrc, 1, -1);
+    bool flat_ok = (Fdst->shape == std::vector<int>{1,6});
+    CHECK(flat_ok, "flatten ok");
+
+    // concat axis=1
+    auto C1 = mk({1,2,3}, {1,1,1, 2,2,2}, tctx);
+    auto C2 = mk({1,1,3}, {3,3,3}, tctx);
+    auto Ccat = ow::nn::concat({C1,C2}, 1);
+    bool cat_ok = (Ccat->shape == std::vector<int>{1,3,3})
+                  && almostTol(Ccat->get_as_float_flat(0), 1.f, kTol)
+                  && almostTol(Ccat->get_as_float_flat(6), 3.f, kTol);
+    CHECK(cat_ok, "concat ok");
+
+    // concat boundary: axis out of range
+    bool axis_throw = false;
+    try { (void)ow::nn::concat({C1, C2}, 10); } catch (...) { axis_throw = true; }
+    CHECK(axis_throw, "concat axis out of range throws");
+    // concat boundary: rank mismatch
+    auto Cmis = mk({1,1,1,3}, {9,9,9}, tctx);
+    bool rank_throw = false; try { (void)ow::nn::concat({C1, Cmis}, 1); } catch (...) { rank_throw = true; }
+    CHECK(rank_throw, "concat rank mismatch throws");
+    // concat boundary: non-axis dims mismatch
+    auto Cn1 = mk({1,2,3}, {1,2,3,4,5,6}, tctx);
+    auto Cn2 = mk({2,1,3}, {7,8,9}, tctx);
+    bool nonaxis_throw = false; try { (void)ow::nn::concat({Cn1, Cn2}, 1); } catch (...) { nonaxis_throw = true; }
+    CHECK(nonaxis_throw, "concat non-axis dims mismatch throws");
+    // concat boundary: empty inputs
+    bool empty_throw = false; try { (void)ow::nn::concat({}, 1); } catch (...) { empty_throw = true; }
+    CHECK(empty_throw, "concat empty inputs throws");
+    // concat boundary: non-contiguous input
+    auto Bc = mk({2,3}, {1,2,3,4,5,6}, tctx);
+    auto bad_strides = ow::nn::Tensor::calc_strides(Bc->shape);
+    bad_strides[0] += 1; // make it non-row-major
+    auto Bview = Bc->view(Bc->shape, bad_strides);
+    bool noncont_throw = false; try { (void)ow::nn::concat({Bc, Bview}, 0); } catch (...) { noncont_throw = true; }
+    CHECK(noncont_throw, "concat non-contiguous input throws");
+
+    // layer_norm
+    auto LNsrc = mk({1,4}, {1,2,3,4}, tctx);
+    auto gamma = mk({4}, {1,1,1,1}, tctx);
+    auto beta  = mk({4}, {0,0,0,0}, tctx);
+    auto LN = ow::nn::layer_norm(LNsrc, gamma, beta, 1e-5f, -1);
+    float mean=0.f, var=0.f;
+    for(int j=0;j<4;++j){ float v = LN->get_as_float_flat(j); mean+=v; var+=v*v; }
+    mean /= 4.f; var = var/4.f;
+    CHECK(almostTol(mean, 0.f, kTol) && almostTol(var, 1.f, kTolLoose), "layer_norm unit stats");
+
+    // batch_norm passthrough with mean=0,var=1,gamma=1,beta=0
+    auto BNsrc = mk({1,2,2,2}, {1,2,3,4, 5,6,7,8}, tctx);
+    auto g1 = mk({2}, {1,1}, tctx);
+    auto b1 = mk({2}, {0,0}, tctx);
+    auto m1 = mk({2}, {0,0}, tctx);
+    auto v1 = mk({2}, {1,1}, tctx);
+    auto BN = ow::nn::batch_norm(BNsrc, g1, b1, m1, v1, 1e-5f);
+    bool bn_ok = true;
+    for(size_t i=0;i<BNsrc->nelements(); ++i){
+      if(!almostTol(BN->get_as_float_flat(i), BNsrc->get_as_float_flat(i), kTol)) bn_ok=false;
+    }
+    CHECK(bn_ok, "batch_norm passthrough ok");
+
+    // ---- Graph-level tests using node factories ----
+    {
+      ow::nn::ComputeGraph g(tctx);
+      auto GA = mk({1,2,3}, {1,2,3, 4,5,6}, tctx);
+      auto GB = mk({1,1,3}, {7,8,9}, tctx);
+      g.add_input("A", GA);
+      g.add_input("B", GB);
+      auto nAf = ow::nn::make_flatten_node("A", "Af"); nAf.attrs["start_axis"] = "1"; nAf.attrs["end_axis"] = "-1"; g.add_node(nAf);
+      auto nBf = ow::nn::make_flatten_node("B", "Bf"); nBf.attrs["start_axis"] = "1"; nBf.attrs["end_axis"] = "-1"; g.add_node(nBf);
+      auto nCat = ow::nn::make_concat_node({"Af","Bf"}, "Cat", 1); g.add_node(nCat);
+      auto nSm = ow::nn::make_softmax_node("Cat", "S", 1); g.add_node(nSm);
+      g.run();
+      auto Sg = g.get_tensor("S");
+      bool graph_ok = (Sg && g.descs.count("Cat") && g.descs["Cat"].shape == std::vector<int>{1,9});
+      if (Sg) {
+        float sum = 0.f; for (int j = 0; j < 9; ++j) sum += Sg->get_as_float_flat(j);
+        graph_ok = graph_ok && almostTol(sum, 1.f, kTol);
+      }
+      CHECK(graph_ok, "graph flatten->concat->softmax ok");
+    }
+
+    // summary
+    std::cout << "[ops] tests summary: " << tests_run << " run, " << tests_failed << " failed\n";
+  } catch (const std::exception &e) {
+    std::cerr << "[ops] sanity tests error: " << e.what() << std::endl;
+  }
+
 
   std::string vocab_path = "assert/vocab.json";
   std::string merges_path = "assert/merges.txt";
