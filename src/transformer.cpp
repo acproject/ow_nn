@@ -151,7 +151,31 @@ MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr&
     : q_proj(q_proj), k_proj(k_proj), v_proj(v_proj), o_proj(o_proj),
       num_heads(num_heads), num_kv_heads(num_kv_heads), hidden_size(hidden_size) {
     
-    head_dim = hidden_size / num_heads;
+    // Infer head_dim from weight shapes to avoid reshape mismatch (supports transposed weights)
+    auto infer_out_dim = [&](const TensorPtr& W) -> int {
+        if (!W || W->shape.size() != 2) return hidden_size;
+        // If W is [in_dim, out_dim]
+        if (W->shape[0] == hidden_size) return W->shape[1];
+        // If W is [out_dim, in_dim]
+        if (W->shape[1] == hidden_size) return W->shape[0];
+        // Fallback
+        return W->shape[1];
+    };
+    int q_out = infer_out_dim(q_proj);
+    int k_out = infer_out_dim(k_proj);
+    int v_out = infer_out_dim(v_proj);
+    int inferred_hd = (num_kv_heads > 0 && k_out % num_kv_heads == 0)
+                        ? (k_out / num_kv_heads)
+                        : ((num_heads > 0 && q_out % num_heads == 0)
+                            ? (q_out / num_heads)
+                            : (hidden_size / std::max(1, num_heads)));
+    head_dim = inferred_hd;
+
+    std::cout << "[MHA] head_dim inference: hidden_size=" << hidden_size
+              << " q_out=" << q_out << " k_out=" << k_out << " v_out=" << v_out
+              << " -> head_dim=" << head_dim << " (num_heads=" << num_heads
+              << ", num_kv_heads=" << num_kv_heads << ")" << std::endl;
+
     q_norm = std::make_shared<RMSNorm>(q_norm_weight);
     k_norm = std::make_shared<RMSNorm>(k_norm_weight);
     rotary_emb = std::make_shared<RotaryEmbedding>(head_dim);
@@ -191,7 +215,22 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     auto k = Tensor::matmul_blocked_mt(hidden_states, k_proj);
     // Use scalar fallback for v to validate kernel correctness on narrow N
     auto v = Tensor::matmul_blocked_mt(hidden_states, v_proj, /*block_m*/64, /*block_n*/1, /*block_k*/64, /*nthreads*/1);
-
+    
+    // Sanitize possible NaN/Inf produced by FP8 conversion or matmul
+    auto sanitize_tensor = [](const TensorPtr& t) {
+        if (!t) return;
+        size_t n = t->nelements();
+        for (size_t i = 0; i < n; ++i) {
+            float v = t->get_as_float_flat(i);
+            if (!(std::isfinite(v))) {
+                t->set_from_float_flat(i, 0.0f);
+            }
+        }
+    };
+    sanitize_tensor(q);
+    sanitize_tensor(k);
+    sanitize_tensor(v);
+    
     // Print raw q/k/v of position 0 before reshape
     int q_print = std::min(q->shape[1], 8);
     int kv_print = std::min(v->shape[1], 8);

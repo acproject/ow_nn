@@ -232,7 +232,11 @@ public:
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x0F) {
-      return sign ? -INFINITY : INFINITY; // treat NaN as Inf for simplicity
+      if (mant == 0) {
+        float inf = std::numeric_limits<float>::infinity();
+        return sign ? -inf : inf;
+      }
+      return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 8.0f;
       int E = (int)exp - bias;
@@ -251,7 +255,11 @@ public:
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x1F) {
-      return sign ? -INFINITY : INFINITY; // treat NaN as Inf for simplicity
+      if (mant == 0) {
+        float inf = std::numeric_limits<float>::infinity();
+        return sign ? -inf : inf;
+      }
+      return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 4.0f;
       int E = (int)exp - bias;
