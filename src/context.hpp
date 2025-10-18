@@ -20,10 +20,50 @@ public:
   void *alloc(size_t bytes) {
     size_t cur = align_up(offset, align_bytes);
     if (cur + bytes > arena.size()) {
-      size_t new_size = std::max(arena.size() * 2, cur + bytes);
-      std::cout << "[Context] Resize arena from " << arena.size() << " to " << new_size
-                << " (need=" << (cur + bytes) << ")" << std::endl;
-      arena.resize(new_size);
+      // Check if the allocation is too large (>10GB for a single tensor)
+      if (bytes > 10ull * 1024ull * 1024ull * 1024ull) {
+        std::cerr << "[Context] Warning: Attempting to allocate very large tensor (" 
+                  << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
+        throw std::bad_alloc();
+      }
+      
+      // Use more conservative growth strategy for large arenas
+      size_t current_size = arena.size();
+      size_t needed_size = cur + bytes;
+      size_t new_size;
+      
+      if (current_size > 16ull * 1024ull * 1024ull * 1024ull) { // > 16GB
+        // For very large arenas, only grow by what's needed + 1GB buffer
+        new_size = needed_size + 1024ull * 1024ull * 1024ull;
+      } else if (current_size > 8ull * 1024ull * 1024ull * 1024ull) { // > 8GB
+        // For large arenas, grow by 1.5x or needed size, whichever is smaller
+        new_size = std::min(current_size + current_size / 2, needed_size + 2ull * 1024ull * 1024ull * 1024ull);
+      } else {
+        // For smaller arenas, use the original doubling strategy
+        new_size = std::max(current_size * 2, needed_size);
+      }
+      
+      std::cout << "[Context] Resize arena from " << current_size << " to " << new_size
+                << " (need=" << needed_size << ")" << std::endl;
+      
+      try {
+        arena.resize(new_size);
+      } catch (const std::bad_alloc& e) {
+        std::cerr << "[Context] Failed to resize arena to " << new_size 
+                  << " bytes (" << (new_size / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
+        
+        // Try a more conservative approach: just allocate what's needed + small buffer
+        size_t minimal_size = needed_size + 512ull * 1024ull * 1024ull; // +512MB buffer
+        std::cout << "[Context] Trying minimal resize to " << minimal_size 
+                  << " bytes (" << (minimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
+        
+        try {
+          arena.resize(minimal_size);
+        } catch (const std::bad_alloc& e2) {
+          std::cerr << "[Context] Failed minimal resize, allocation impossible" << std::endl;
+          throw;
+        }
+      }
     }
     void *ptr = arena.data() + cur;
     offset = cur + bytes;

@@ -149,7 +149,9 @@ static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const 
 static std::string normalize_weight_name(const std::string &name) {
     const std::string prefix = "model.language_model.";
     if (name.rfind(prefix, 0) == 0) {
-        return std::string("model.") + name.substr(prefix.size());
+        std::string normalized = std::string("model.") + name.substr(prefix.size());
+        std::cout << "[WeightMap] " << name << " -> " << normalized << std::endl;
+        return normalized;
     }
     return name;
 }
@@ -325,10 +327,14 @@ int main(int argc, char **argv) {
     std::cout << "[GEN] Loading weights with lazy strategy...\n";
     
     for (const auto &name : gen_loader.names()) {
+        // Load all model weights including language_model, embed_tokens, lm_head, and norm
         if (name.rfind("model.language_model.", 0) == 0 ||
+            name.rfind("model.embed_tokens.", 0) == 0 ||
+            name.rfind("model.norm.", 0) == 0 ||
             name == "model.embed_tokens.weight" ||
             name == "lm_head.weight" ||
-            name == "model.lm_head.weight") {
+            name == "model.lm_head.weight" ||
+            name == "model.norm.weight") {
             try {
                 // Use copy=true to avoid keeping large files mapped
                 auto t = gen_loader.make_tensor(name, gen_ctx, /*copy=*/true);
