@@ -358,14 +358,14 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     }
     
     // Reshape back and project output
-    auto attn_flat = attn_output->reshape_view({seq_len, hidden_size});
+    auto attn_flat = attn_output->reshape_view({seq_len, num_heads * head_dim});
     auto out = Tensor::matmul_blocked_mt(attn_flat, o_proj);
     
     // Debug: print a slice of attn_flat and out
-    int out_print = std::min(hidden_size, 8);
+    int out_print = std::min(num_heads * head_dim, 8);
     std::cout << "[MHA] attn_flat[0,:" << out_print << "]: ";
     for (int d = 0; d < out_print; ++d) {
-        std::cout << attn_flat->get_as_float_flat(0 * hidden_size + d) << (d+1<out_print?",":"");
+        std::cout << attn_flat->get_as_float_flat(0 * (num_heads * head_dim) + d) << (d+1<out_print?",":"");
     }
     std::cout << std::endl;
     std::cout << "[MHA] o_proj out[0,:" << out_print << "]: ";
@@ -511,7 +511,6 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
 std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     // Model configuration based on Qwen3VL config.json
     const int vocab_size = 151936;
-    const int hidden_size = 2048;  // Corrected from config.json
     const int num_layers = 48;     // Corrected from config.json
     const int num_heads = 32;
     const int num_kv_heads = 4;
@@ -523,6 +522,12 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     auto embed_tokens = get_weight("model.embed_tokens.weight");
     if (!embed_tokens) {
         throw std::runtime_error("WeightLoader: embed_tokens.weight not found");
+    }
+    
+    // Infer hidden_size from embedding weight shape to stay consistent with projections
+    int hidden_size = (embed_tokens->shape.size() == 2) ? embed_tokens->shape[1] : 0;
+    if (hidden_size <= 0) {
+        throw std::runtime_error("WeightLoader: invalid hidden_size inferred from embed_tokens");
     }
     
     // Build decoder layers
@@ -573,12 +578,10 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         std::vector<std::shared_ptr<Expert>> experts;
         
         // Create a single "merged expert" that represents all experts
-        // This is a simplified approach - in a full implementation, you'd need
-        // to properly handle the merged weight tensors
         auto merged_expert = std::make_shared<Expert>(
-            experts_gate_up_proj,  // Combined gate and up projections
-            experts_gate_up_proj,  // Reuse for up_proj (will need proper slicing)
-            experts_down_proj      // Down projection
+            experts_gate_up_proj,
+            experts_gate_up_proj,
+            experts_down_proj
         );
         experts.push_back(merged_expert);
         

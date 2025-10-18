@@ -108,10 +108,34 @@ public:
     size_t new_ne = 1;
     for (int d : new_shape)
       new_ne *= (size_t)d;
-    if (new_ne != nelements())
+    if (new_ne != nelements()) {
+      std::cerr << "[Tensor] reshape_view size mismatch: old_shape=[";
+      for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) std::cerr << ",";
+        std::cerr << shape[i];
+      }
+      std::cerr << "] ne=" << nelements() << " new_shape=[";
+      for (size_t i = 0; i < new_shape.size(); ++i) {
+        if (i) std::cerr << ",";
+        std::cerr << new_shape[i];
+      }
+      std::cerr << "] new_ne=" << new_ne << std::endl;
       throw std::runtime_error("reshape size mismatch");
-    if (!is_contiguous_row_major())
+    }
+    if (!is_contiguous_row_major()) {
+      std::cerr << "[Tensor] reshape_view requires contiguous tensor: old_shape=[";
+      for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) std::cerr << ",";
+        std::cerr << shape[i];
+      }
+      std::cerr << "] strides=[";
+      for (size_t i = 0; i < strides.size(); ++i) {
+        if (i) std::cerr << ",";
+        std::cerr << strides[i];
+      }
+      std::cerr << "]" << std::endl;
       throw std::runtime_error("reshape_view requires contiguous tensor");
+    }
     Tensor *raw = new Tensor(dtype, new_shape);
     raw->strides = calc_strides(new_shape);
     raw->data = data;
