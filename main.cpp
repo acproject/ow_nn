@@ -383,8 +383,24 @@ int main(int argc, char **argv) {
       auto ids = tok.encode(prompt_text);
       int max_new_tokens = 64;
       std::string answer;
+      int consecutive_empty_tokens = 0;
       for (int step = 0; step < max_new_tokens; ++step) {
         auto hidden_states = model->forward(ids);
+        
+        // Check for NaN in hidden states
+        bool has_nan = false;
+        size_t n = hidden_states->nelements();
+        for (size_t i = 0; i < std::min(n, size_t(100)); ++i) {
+          if (std::isnan(hidden_states->get_as_float_flat(i))) {
+            has_nan = true;
+            break;
+          }
+        }
+        if (has_nan) {
+          std::cerr << "[ERROR] NaN detected in hidden states at step " << step << ", stopping generation" << std::endl;
+          break;
+        }
+        
         int seq_len2 = (int)ids.size();
         int hidden_size2 = hidden_states->shape[1];
         auto last_hidden = hidden_states->slice_view({seq_len2 - 1, 0}, {1, hidden_size2});
@@ -395,6 +411,21 @@ int main(int argc, char **argv) {
         if (!vocab_weight) throw std::runtime_error("No vocab projection weight found");
 
         auto logits = matvec_rows_dot(last_hidden, vocab_weight);
+        
+        // Check for NaN in logits
+        has_nan = false;
+        n = logits->nelements();
+        for (size_t i = 0; i < n; ++i) {
+          if (std::isnan(logits->get_as_float_flat(i))) {
+            has_nan = true;
+            break;
+          }
+        }
+        if (has_nan) {
+          std::cerr << "[ERROR] NaN detected in logits at step " << step << ", stopping generation" << std::endl;
+          break;
+        }
+        
         // Optional: print top-5 for debugging
         auto top5 = topk_indices_from_logits(logits, 5);
         std::cout << "[DBG top-5] ";
@@ -407,6 +438,17 @@ int main(int argc, char **argv) {
         std::string piece = tok.decode({next_id});
         std::cout << piece << std::flush;
         answer += piece;
+
+        // Check for consecutive empty or problematic tokens
+        if (piece.empty() || piece == " " || piece == "\t") {
+          consecutive_empty_tokens++;
+          if (consecutive_empty_tokens > 10) {
+            std::cerr << "[WARNING] Too many consecutive empty tokens, stopping generation" << std::endl;
+            break;
+          }
+        } else {
+          consecutive_empty_tokens = 0;
+        }
 
         if (!piece.empty() && piece.back() == '\n') break;
       }

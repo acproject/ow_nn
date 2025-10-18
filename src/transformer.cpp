@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <iostream>
 #include <unordered_map>
+#include <set>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -27,9 +28,16 @@ static TensorPtr ensure_linear_weight_or_transpose(const TensorPtr& W, int expec
     if (ok_no_transpose) return W;
     bool can_transpose = (r1 == expected_in_dim) && (expected_out_dim < 0 || r0 == expected_out_dim);
     if (can_transpose) {
-        std::cerr << "[Weight] Using transposed orientation without copy: expected ["
-                  << expected_in_dim << "," << (expected_out_dim<0? r0: expected_out_dim)
-                  << "] got [" << r0 << "," << r1 << "]" << std::endl;
+        // Only print warning once per unique dimension combination to reduce log spam
+        static std::set<std::string> warned_combinations;
+        std::string key = std::to_string(r0) + "x" + std::to_string(r1) + "->" + 
+                         std::to_string(expected_in_dim) + "x" + std::to_string(expected_out_dim<0? r0: expected_out_dim);
+        if (warned_combinations.find(key) == warned_combinations.end()) {
+            std::cerr << "[Weight] Using transposed orientation without copy: expected ["
+                      << expected_in_dim << "," << (expected_out_dim<0? r0: expected_out_dim)
+                      << "] got [" << r0 << "," << r1 << "] (further similar warnings suppressed)" << std::endl;
+            warned_combinations.insert(key);
+        }
         return W; // rely on matmul auto-handling
     }
     // Dimensions don't match expectations; return as-is and let call sites fail loudly.
@@ -217,19 +225,28 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     auto v = Tensor::matmul_blocked_mt(hidden_states, v_proj, /*block_m*/64, /*block_n*/1, /*block_k*/64, /*nthreads*/1);
     
     // Sanitize possible NaN/Inf produced by FP8 conversion or matmul
-    auto sanitize_tensor = [](const TensorPtr& t) {
+    auto sanitize_tensor = [](const TensorPtr& t, const std::string& name = "") {
         if (!t) return;
         size_t n = t->nelements();
+        size_t nan_count = 0, inf_count = 0;
         for (size_t i = 0; i < n; ++i) {
             float v = t->get_as_float_flat(i);
-            if (!(std::isfinite(v))) {
+            if (std::isnan(v)) {
+                nan_count++;
                 t->set_from_float_flat(i, 0.0f);
+            } else if (std::isinf(v)) {
+                inf_count++;
+                t->set_from_float_flat(i, std::copysign(1e6f, v)); // Clamp to large but finite value
             }
         }
+        if (nan_count > 0 || inf_count > 0) {
+            std::cerr << "[SANITIZE] " << name << ": fixed " << nan_count << " NaN(s) and " 
+                      << inf_count << " Inf(s) out of " << n << " elements" << std::endl;
+        }
     };
-    sanitize_tensor(q);
-    sanitize_tensor(k);
-    sanitize_tensor(v);
+    sanitize_tensor(q, "q_proj");
+    sanitize_tensor(k, "k_proj");
+    sanitize_tensor(v, "v_proj");
     
     // Print raw q/k/v of position 0 before reshape
     int q_print = std::min(q->shape[1], 8);
@@ -348,9 +365,11 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     // Reshape back and project output
     auto attn_flat = attn_output->reshape_view({seq_len, num_heads * head_dim});
     auto out = Tensor::matmul_blocked_mt(attn_flat, o_proj);
-    
-    // Debug: print a slice of attn_flat and out
-    int out_print = std::min(num_heads * head_dim, 8);
+    // Sanitize potential NaNs from FP8 matmul
+    sanitize_tensor(out, "o_proj");
+     
+     // Debug: print a slice of attn_flat and out
+     int out_print = std::min(num_heads * head_dim, 8);
     std::cout << "[MHA] attn_flat[0,:" << out_print << "]: ";
     for (int d = 0; d < out_print; ++d) {
         std::cout << attn_flat->get_as_float_flat(0 * (num_heads * head_dim) + d) << (d+1<out_print?",":"");
@@ -431,18 +450,21 @@ TensorPtr Expert::forward(const TensorPtr& x) {
 TensorPtr SparseMoEBlock::forward(const TensorPtr& x) {
     auto ctx = x->ctx.lock();
     if (!ctx) throw std::runtime_error("SparseMoEBlock: ctx expired");
-    // Router scores: [seq_len, num_experts]
+    // Router scores: [seq_len, num_experts_from_gate]
     auto scores = Tensor::matmul_blocked_mt(x, gate);
     int seq_len = x->shape[0];
     int hidden_size = x->shape[1];
+    int gate_cols = scores->shape[1];
+    int available = std::min(num_experts, gate_cols);
     auto output = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
-    
+
     // Top-1 routing per token for simplicity
     for (int i = 0; i < seq_len; ++i) {
         int best = 0;
         float best_score = -1e30f;
-        for (int e = 0; e < num_experts; ++e) {
-            float s = scores->get_as_float_flat((size_t)i * num_experts + e);
+        for (int e = 0; e < available; ++e) {
+            float s = scores->get_as_float_flat((size_t)i * gate_cols + e);
+            if (!std::isfinite(s)) s = -1e30f;
             if (s > best_score) { best_score = s; best = e; }
         }
         // x[i,:] view
@@ -536,6 +558,12 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
         throw std::runtime_error("Qwen3VLTextModel: cannot infer hidden_size from embed_tokens shape");
     }
 
+    // Sanitize hidden_states to avoid propagating NaN/Inf from FP8 embeddings
+    for (size_t i = 0; i < hidden_states->nelements(); ++i) {
+        float v = hidden_states->get_as_float_flat(i);
+        if (!std::isfinite(v)) hidden_states->set_from_float_flat(i, 0.0f);
+    }
+
     size_t mark = ctx->mark();
     
     // decoder layers
@@ -599,13 +627,15 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         auto k_proj = ensure_linear_weight_or_transpose(k_proj_raw, hidden_size);
         auto v_proj = ensure_linear_weight_or_transpose(v_proj_raw, hidden_size);
         auto o_proj = ensure_linear_weight_or_transpose(o_proj_raw, hidden_size, hidden_size);
-        
-        // Create attention layer
-        auto attention = std::make_shared<MultiHeadAttention>(
-            q_proj, k_proj, v_proj, o_proj,
-            q_norm_weight, k_norm_weight,
-            num_heads, num_kv_heads, hidden_size
-        );
+        // Avoid FP8 NaNs in output projection by converting to FLOAT32
+        o_proj = o_proj->astype(DType::FLOAT32);
+         
+          // Create attention layer
+          auto attention = std::make_shared<MultiHeadAttention>(
+              q_proj, k_proj, v_proj, o_proj,
+              q_norm_weight, k_norm_weight,
+              num_heads, num_kv_heads, hidden_size
+          );
         
         // MoE weights - this model uses merged expert weights
         auto gate_weight_raw = get_weight(layer_prefix + "mlp.gate.weight");
@@ -618,22 +648,15 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         }
         
         auto gate_weight = ensure_linear_weight_or_transpose(gate_weight_raw, hidden_size);
+        // Derive router expert count from gate weight dims (supports transposed layout)
+        int router_experts = (gate_weight->shape[0] == hidden_size)
+                               ? gate_weight->shape[1]
+                               : gate_weight->shape[0];
+        std::cout << "[MoE] Router experts from gate weight: " << router_experts << std::endl;
         
-        // Diagnostics for MoE weights
-        auto print_shape = [&](const char* tag, const TensorPtr& W){
-            if (!W) { std::cout << tag << "=(null)" << std::endl; return; }
-            std::cout << tag << ": rank=" << W->shape.size() << " dims=";
-            for (size_t di=0; di<W->shape.size(); ++di) {
-                std::cout << W->shape[di] << (di+1<W->shape.size()?",":"");
-            }
-            std::cout << std::endl;
-        };
-        print_shape("[MoE] gate", gate_weight);
-        print_shape("[MoE] experts_gate_up_proj", experts_gate_up_proj);
-        print_shape("[MoE] experts_down_proj", experts_down_proj);
-        
-        // Build experts: if weights are 3D [E, H, 2I] and [E, I, H], slice per expert and reshape to 2D
+        // Prepare expert container
         std::vector<std::shared_ptr<Expert>> experts;
+        
         if (experts_gate_up_proj && experts_down_proj &&
             experts_gate_up_proj->shape.size() == 3 && experts_down_proj->shape.size() == 3) {
             int E = experts_gate_up_proj->shape[0];
@@ -645,28 +668,29 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
             int I = I_down;
             if (I <= 0 || (GU % 2) != 0) I = GU / 2;
             intermediate_size = (intermediate_size < 0) ? I : intermediate_size;
-            std::cout << "[MoE] Slicing merged experts: E=" << E
-                      << " H=" << H << " GU=" << GU
-                      << " -> inferred I=" << I << " H_down=" << H_down << std::endl;
-            for (int e = 0; e < E; ++e) {
-                // Gate part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
-                auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
-                auto gate_e_3d_contig = gate_e_3d->astype(DType::FLOAT32);
-                auto gate_e = gate_e_3d_contig->reshape_view({H, I});
-                gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
-                
-                // Up part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
-                auto up_e_3d = experts_gate_up_proj->slice_view({e, 0, I}, {1, H, I});
-                auto up_e_3d_contig = up_e_3d->astype(DType::FLOAT32);
-                auto up_e = up_e_3d_contig->reshape_view({H, I});
-                up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
-                
-                // Down part: [1,I,H] -> [I,H]; this slice is contiguous, reshape directly
-                auto down_e_3d = experts_down_proj->slice_view({e, 0, 0}, {1, I, hidden_size});
-                auto down_e = down_e_3d->reshape_view({I, hidden_size});
-                down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
-                
-                experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
+            int build_E = std::min(E, router_experts);
+             std::cout << "[MoE] Slicing merged experts: E=" << E
+                       << " H=" << H << " GU=" << GU
+                       << " -> inferred I=" << I << " H_down=" << H_down
+                       << " build_E=" << build_E << std::endl;
+             for (int e = 0; e < build_E; ++e) {
+                 // Gate part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
+                 auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
+                 // Create a 2D view using inner strides to avoid large copies
+                 auto gate_e = gate_e_3d->view({H, I}, {gate_e_3d->strides[1], gate_e_3d->strides[2]});
+                 gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
+                 
+                 // Up part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
+                 auto up_e_3d = experts_gate_up_proj->slice_view({e, 0, I}, {1, H, I});
+                 auto up_e = up_e_3d->view({H, I}, {up_e_3d->strides[1], up_e_3d->strides[2]});
+                 up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
+                 
+                 // Down part: [1,I,H] -> [I,H]; this slice is contiguous, reshape directly
+                 auto down_e_3d = experts_down_proj->slice_view({e, 0, 0}, {1, I, hidden_size});
+                 auto down_e = down_e_3d->reshape_view({I, hidden_size});
+                 down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
+               
+                 experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
             }
             std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
         } else {
