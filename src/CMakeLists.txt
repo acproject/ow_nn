@@ -7,6 +7,7 @@ set(SOURCES
     tensor.hpp
     cgraph.hpp
     safetensors_loader.hpp
+    lazy_safetensors_loader.hpp
     ops.hpp
 )
 

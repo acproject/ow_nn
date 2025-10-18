@@ -16,6 +16,7 @@
  #include "include/ow_nn.h"
 #include "include/transformer.h"
 #include "src/safetensors_loader.hpp"
+#include "src/lazy_safetensors_loader.hpp"
 #include "src/context.hpp"
 #include "src/tensor.hpp"
 #include "include/tokenizer.h"
@@ -313,21 +314,33 @@ int main(int argc, char **argv) {
     std::string model_dir = weights_dir.empty() ? std::string(DEFAULT_WEIGHTS_DIR) : weights_dir;
     std::cout << "[GEN] Using model dir: " << model_dir << "\n";
 
-    ow::nn::SafetensorsLoader gen_loader;
+    ow::nn::LazySafetensorsLoader gen_loader;
     gen_loader.load_dir(model_dir);
     // Use 64MB initial arena size, will grow dynamically as needed
     auto gen_ctx = std::make_shared<ow::nn::Context>(64ull * 1024ull * 1024ull);
 
     // Filter and load text-only weights to reduce memory usage
+    // Use lazy loading with copy=true for large files to avoid keeping them mapped
     std::unordered_map<std::string, ow::nn::TensorPtr> all_weights;
+    std::cout << "[GEN] Loading weights with lazy strategy...\n";
+    
     for (const auto &name : gen_loader.names()) {
         if (name.rfind("model.language_model.", 0) == 0 ||
             name == "model.embed_tokens.weight" ||
             name == "lm_head.weight" ||
             name == "model.lm_head.weight") {
             try {
-                auto t = gen_loader.make_tensor(name, gen_ctx, /*copy=*/false);
-                if (t) all_weights.emplace(name, t);
+                // Use copy=true to avoid keeping large files mapped
+                auto t = gen_loader.make_tensor(name, gen_ctx, /*copy=*/true);
+                if (t) {
+                    all_weights.emplace(name, t);
+                    std::cout << "[Weight][loaded] " << name << " shape: [";
+                    for (size_t i = 0; i < t->shape.size(); i++) {
+                        std::cout << t->shape[i];
+                        if (i < t->shape.size() - 1) std::cout << ", ";
+                    }
+                    std::cout << "]\n";
+                }
             } catch (const std::exception &ex) {
                 std::cerr << "[Weight][skip] " << name << " due to: " << ex.what() << "\n";
             }
