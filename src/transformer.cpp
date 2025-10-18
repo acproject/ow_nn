@@ -76,15 +76,22 @@ TensorPtr RMSNorm::forward(const TensorPtr& x) {
         float sum_sq = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             float val = x->get_as_float_flat(i * hidden_size + j);
+            if (!std::isfinite(val)) val = 0.0f;
             sum_sq += val * val;
         }
-        float rms = std::sqrt(sum_sq / hidden_size + eps);
+        float denom = sum_sq / hidden_size + eps;
+        if (!std::isfinite(denom) || denom <= 0.0f) denom = std::max(eps, 1e-6f);
+        float rms = std::sqrt(denom);
+        if (!std::isfinite(rms) || rms < 1e-6f) rms = 1e-6f;
         
         // Normalize and scale
         for (int j = 0; j < hidden_size; ++j) {
             float val = x->get_as_float_flat(i * hidden_size + j);
+            if (!std::isfinite(val)) val = 0.0f;
             float weight_val = weight->get_as_float_flat(j);
+            if (!std::isfinite(weight_val)) weight_val = 1.0f;
             float normalized = (val / rms) * weight_val;
+            if (!std::isfinite(normalized)) normalized = 0.0f;
             output->set_from_float_flat(i * hidden_size + j, normalized);
         }
     }

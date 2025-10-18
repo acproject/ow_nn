@@ -256,11 +256,9 @@ public:
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x0F) {
-      if (mant == 0) {
-        float inf = std::numeric_limits<float>::infinity();
-        return sign ? -inf : inf;
-      }
-      return std::numeric_limits<float>::quiet_NaN();
+      // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
+      // Treat both Inf and NaN as 0.0f to keep weights numerically stable
+      return 0.0f;
     } else {
       float m = 1.0f + mant / 8.0f;
       int E = (int)exp - bias;
@@ -279,11 +277,8 @@ public:
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x1F) {
-      if (mant == 0) {
-        float inf = std::numeric_limits<float>::infinity();
-        return sign ? -inf : inf;
-      }
-      return std::numeric_limits<float>::quiet_NaN();
+      // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
+      return 0.0f;
     } else {
       float m = 1.0f + mant / 4.0f;
       int E = (int)exp - bias;
@@ -503,6 +498,9 @@ public:
         if (j < j1) {
           size_t bi = (size_t)src_p * n + j;
           bv = B->get_as_float_flat(bi);
+          if (!std::isfinite(bv)) bv = 0.0f;
+          else if (bv > 1e6f) bv = 1e6f;
+          else if (bv < -1e6f) bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
@@ -523,6 +521,9 @@ public:
         if (j < j1) {
           size_t bi = (size_t)j * k + src_p; // index [j, src_p]
           bv = B->get_as_float_flat(bi);
+          if (!std::isfinite(bv)) bv = 0.0f;
+          else if (bv > 1e6f) bv = 1e6f;
+          else if (bv < -1e6f) bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
@@ -637,9 +638,9 @@ public:
                 int width = jend - jpanel;
                 std::vector<float> acc(width, 0.0f);
                 for (int p = 0; p < k_len; ++p) {
-                  float a = fastA
-                                ? Arow[p]
-                                : A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  float a = fastA ? Arow[p]
+                                  : A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  if (!std::isfinite(a)) a = 0.0f;
                   const float *bvec = pack.data() + p * W;
                   for (int l = 0; l < width; ++l) {
                     acc[l] += a * bvec[l];
@@ -733,6 +734,7 @@ public:
             for (int p = 0; p < k_len; ++p) {
               float a = fastA ? Arow_p0[p]
                               : A->get_as_float_flat((size_t)p0 + p);
+              if (!std::isfinite(a)) a = 0.0f;
               const float *bvec = pack.data() + p * W;
               for (int l = 0; l < width; ++l) {
                 Rptr[l] += a * bvec[l];
