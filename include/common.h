@@ -14,7 +14,15 @@ enum class DType {
   FP16,
   BF16,
   INT8,
-  Q4_0
+  Q4_0,
+  // 新增更广泛的权重/张量类型支持
+  U8,
+  BOOL,
+  I16,
+  I64,
+  F64,
+  FP8_E4M3,
+  FP8_E5M2
 };
 
 inline size_t dtype_size(DType t) {
@@ -31,7 +39,20 @@ inline size_t dtype_size(DType t) {
     return 1;
   case DType::Q4_0:
     return 1;
-
+  case DType::U8:
+    return 1;
+  case DType::BOOL:
+    return 1;
+  case DType::I16:
+    return 2;
+  case DType::I64:
+    return 8;
+  case DType::F64:
+    return 8;
+  case DType::FP8_E4M3:
+    return 1;
+  case DType::FP8_E5M2:
+    return 1;
   }
   return 1;
 }

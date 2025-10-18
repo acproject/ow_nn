@@ -19,6 +19,7 @@
 #include "src/lazy_safetensors_loader.hpp"
 #include "src/context.hpp"
 #include "src/tensor.hpp"
+#include "src/memory_optimizer.hpp"
 #include "include/tokenizer.h"
 #include <unordered_map>
 
@@ -40,12 +41,19 @@ static bool str_contains(const std::string &s, const std::string &sub) {
 
 static const char* dtype_to_cstr(ow::nn::DType dt) {
   switch (dt) {
-    case ow::nn::DType::FLOAT32: return "float32";
-    case ow::nn::DType::INT32:   return "int32";
-    case ow::nn::DType::FP16:    return "fp16";
-    case ow::nn::DType::BF16:    return "bf16";
-    case ow::nn::DType::INT8:    return "int8";
-    case ow::nn::DType::Q4_0:    return "q4_0";
+    case ow::nn::DType::FLOAT32:   return "float32";
+    case ow::nn::DType::INT32:     return "int32";
+    case ow::nn::DType::FP16:      return "fp16";
+    case ow::nn::DType::BF16:      return "bf16";
+    case ow::nn::DType::INT8:      return "int8";
+    case ow::nn::DType::Q4_0:      return "q4_0";
+    case ow::nn::DType::U8:        return "u8";
+    case ow::nn::DType::BOOL:      return "bool";
+    case ow::nn::DType::I16:       return "i16";
+    case ow::nn::DType::I64:       return "i64";
+    case ow::nn::DType::F64:       return "f64";
+    case ow::nn::DType::FP8_E4M3:  return "fp8_e4m3";
+    case ow::nn::DType::FP8_E5M2:  return "fp8_e5m2";
     default: return "unknown";
   }
 }
@@ -318,40 +326,25 @@ int main(int argc, char **argv) {
 
     ow::nn::LazySafetensorsLoader gen_loader;
     gen_loader.load_dir(model_dir);
-    // Use 64MB initial arena size, will grow dynamically as needed
-    auto gen_ctx = std::make_shared<ow::nn::Context>(64ull * 1024ull * 1024ull);
-
-    // Filter and load text-only weights to reduce memory usage
-    // Use lazy loading with copy=true for large files to avoid keeping them mapped
-    std::unordered_map<std::string, ow::nn::TensorPtr> all_weights;
-    std::cout << "[GEN] Loading weights with lazy strategy...\n";
     
-    for (const auto &name : gen_loader.names()) {
-        // Load all model weights including language_model, embed_tokens, lm_head, and norm
-        if (name.rfind("model.language_model.", 0) == 0 ||
-            name.rfind("model.embed_tokens.", 0) == 0 ||
-            name.rfind("model.norm.", 0) == 0 ||
-            name == "model.embed_tokens.weight" ||
-            name == "lm_head.weight" ||
-            name == "model.lm_head.weight" ||
-            name == "model.norm.weight") {
-            try {
-                // Use copy=true to avoid keeping large files mapped
-                auto t = gen_loader.make_tensor(name, gen_ctx, /*copy=*/true);
-                if (t) {
-                    all_weights.emplace(name, t);
-                    std::cout << "[Weight][loaded] " << name << " shape: [";
-                    for (size_t i = 0; i < t->shape.size(); i++) {
-                        std::cout << t->shape[i];
-                        if (i < t->shape.size() - 1) std::cout << ", ";
-                    }
-                    std::cout << "]\n";
-                }
-            } catch (const std::exception &ex) {
-                std::cerr << "[Weight][skip] " << name << " due to: " << ex.what() << "\n";
-            }
-        }
-    }
+    // Use MemoryOptimizer to determine optimal context size
+    size_t optimal_size = ow::nn::MemoryOptimizer::get_optimal_initial_context_size();
+    auto gen_ctx = std::make_shared<ow::nn::Context>(optimal_size);
+    
+    std::cout << "[GEN] Using optimized context size: " 
+              << (optimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
+    
+    // Use MemoryOptimizer for intelligent weight loading
+    std::vector<std::string> weight_patterns = {
+        "model.language_model",
+        "model.embed_tokens", 
+        "model.norm",
+        "lm_head"
+    };
+    
+    auto all_weights = ow::nn::MemoryOptimizer::load_weights_optimized(
+        gen_loader, gen_ctx, weight_patterns, true // use memory mapping
+    );
 
     ow::nn::WeightLoader wl;
     for (const auto &kv : all_weights) {

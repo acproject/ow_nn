@@ -61,17 +61,18 @@ static inline size_t st_dtype_size(const std::string &s) {
 }
 
 static inline DType st_to_dtype(const std::string &s) {
-  if (s == "F32")
-    return DType::FLOAT32;
-  if (s == "F16")
-    return DType::FP16;
-  if (s == "BF16")
-    return DType::BF16;
-  if (s == "I32")
-    return DType::INT32;
-  if (s == "I8")
-    return DType::INT8;
-  // Extend as needed (BF16, etc.)
+  if (s == "F32") return DType::FLOAT32;
+  if (s == "F16") return DType::FP16;
+  if (s == "BF16") return DType::BF16;
+  if (s == "I32") return DType::INT32;
+  if (s == "I8")  return DType::INT8;
+  if (s == "U8")  return DType::U8;
+  if (s == "BOOL") return DType::BOOL;
+  if (s == "I16") return DType::I16;
+  if (s == "I64") return DType::I64;
+  if (s == "F64") return DType::F64;
+  if (s == "F8_E4M3") return DType::FP8_E4M3;
+  if (s == "F8_E5M2") return DType::FP8_E5M2;
   throw std::runtime_error("unsupported dtype for ow::nn:" + s);
 }
 
@@ -476,39 +477,95 @@ struct SafetensorsLoader {
       std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F8_E4M3") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_fp8_e4m3_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_fp8_e4m3_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::FP8_E4M3, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F8_E5M2") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_fp8_e5m2_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_fp8_e5m2_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::FP8_E5M2, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "U8") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_u8_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_u8_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::U8, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "BOOL") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_bool_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_bool_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::BOOL, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "I16") {
-      auto T = Tensor::create(ctx, e.shape, DType::INT32);
-      size_t n = T->nelements();
-      convert_i16_to_i32(src, reinterpret_cast<int32_t *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::INT32);
+        size_t n = T->nelements();
+        convert_i16_to_i32(src, reinterpret_cast<int32_t *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::I16, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "I64") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_i64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_i64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::I64, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F64") {
-      auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_f64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+      if (copy) {
+        auto T = Tensor::create(ctx, e.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_f64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::F64, e.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      auto owner = f.mm;
+      std::shared_ptr<Tensor> T(raw, [owner](Tensor *p) { delete p; });
       return T;
     } else {
       throw std::runtime_error("unsupported dtype for ow::nn:" + sd);

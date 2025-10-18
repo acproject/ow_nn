@@ -220,6 +220,46 @@ public:
   }
 
   // flattened access helpers
+  // FP8 decode helpers (E4M3, E5M2)
+  static inline float fp8_e4m3_to_f32(uint8_t x) {
+    uint8_t sign = x >> 7;
+    uint8_t exp = (x >> 3) & 0x0F;
+    uint8_t mant = x & 0x07;
+    const int bias = 7;
+    if (exp == 0) {
+      if (mant == 0) return sign ? -0.0f : 0.0f;
+      float m = mant / 8.0f;
+      float val = std::ldexp(m, 1 - bias);
+      return sign ? -val : val;
+    } else if (exp == 0x0F) {
+      return sign ? -INFINITY : INFINITY; // treat NaN as Inf for simplicity
+    } else {
+      float m = 1.0f + mant / 8.0f;
+      int E = (int)exp - bias;
+      float val = std::ldexp(m, E);
+      return sign ? -val : val;
+    }
+  }
+  static inline float fp8_e5m2_to_f32(uint8_t x) {
+    uint8_t sign = x >> 7;
+    uint8_t exp = (x >> 2) & 0x1F;
+    uint8_t mant = x & 0x03;
+    const int bias = 15;
+    if (exp == 0) {
+      if (mant == 0) return sign ? -0.0f : 0.0f;
+      float m = mant / 4.0f;
+      float val = std::ldexp(m, 1 - bias);
+      return sign ? -val : val;
+    } else if (exp == 0x1F) {
+      return sign ? -INFINITY : INFINITY; // treat NaN as Inf for simplicity
+    } else {
+      float m = 1.0f + mant / 4.0f;
+      int E = (int)exp - bias;
+      float val = std::ldexp(m, E);
+      return sign ? -val : val;
+    }
+  }
+
   float get_as_float_flat(size_t index) const {
     if (dtype == DType::FLOAT32) {
       const float *p = reinterpret_cast<const float *>(data);
@@ -240,6 +280,34 @@ public:
     if (dtype == DType::INT8) {
       const int8_t *p = reinterpret_cast<const int8_t *>(data);
       return float(p[index]);
+    }
+    if (dtype == DType::U8) {
+      const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
+      return float(p[index]);
+    }
+    if (dtype == DType::BOOL) {
+      const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
+      return p[index] ? 1.0f : 0.0f;
+    }
+    if (dtype == DType::I16) {
+      const int16_t *p = reinterpret_cast<const int16_t *>(data);
+      return float(p[index]);
+    }
+    if (dtype == DType::I64) {
+      const int64_t *p = reinterpret_cast<const int64_t *>(data);
+      return float(p[index]);
+    }
+    if (dtype == DType::F64) {
+      const double *p = reinterpret_cast<const double *>(data);
+      return (float)p[index];
+    }
+    if (dtype == DType::FP8_E4M3) {
+      const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
+      return fp8_e4m3_to_f32(p[index]);
+    }
+    if (dtype == DType::FP8_E5M2) {
+      const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
+      return fp8_e5m2_to_f32(p[index]);
     }
     if (dtype == DType::Q4_0) {
       const uint8_t *p = reinterpret_cast<const uint8_t *>(data);

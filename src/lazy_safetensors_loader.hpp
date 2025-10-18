@@ -390,46 +390,95 @@ struct LazySafetensorsLoader {
       std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F8_E4M3") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_fp8_e4m3_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_fp8_e4m3_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::FP8_E4M3, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F8_E5M2") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_fp8_e5m2_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_fp8_e5m2_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::FP8_E5M2, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "U8") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_u8_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_u8_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::U8, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "BOOL") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_bool_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_bool_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::BOOL, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "I16") {
-      auto T = Tensor::create(ctx, entry.shape, DType::INT32);
-      size_t n = T->nelements();
-      convert_i16_to_i32(src, reinterpret_cast<int32_t *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::INT32);
+        size_t n = T->nelements();
+        convert_i16_to_i32(src, reinterpret_cast<int32_t *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::I16, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "I64") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_i64_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_i64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::I64, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else if (sd == "F64") {
-      auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
-      size_t n = T->nelements();
-      convert_f64_to_f32(src, reinterpret_cast<float *>(T->data), n);
-      file.mm->unmap();
+      if (copy) {
+        auto T = Tensor::create(ctx, entry.shape, DType::FLOAT32);
+        size_t n = T->nelements();
+        convert_f64_to_f32(src, reinterpret_cast<float *>(T->data), n);
+        file.mm->unmap();
+        return T;
+      }
+      Tensor *raw = new Tensor(DType::F64, entry.shape);
+      raw->data = const_cast<uint8_t *>(src);
+      raw->ctx = ctx;
+      std::shared_ptr<Tensor> T(raw, [file](Tensor *p) { delete p; });
       return T;
     } else {
       file.mm->unmap();

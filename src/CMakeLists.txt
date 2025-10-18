@@ -8,6 +8,7 @@ set(SOURCES
     cgraph.hpp
     safetensors_loader.hpp
     lazy_safetensors_loader.hpp
+    memory_optimizer.hpp
     ops.hpp
 )
 
