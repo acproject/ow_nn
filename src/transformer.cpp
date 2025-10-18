@@ -311,22 +311,14 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     }
     std::cout << std::endl;
     
-    // Compute attention scores
-    // For simplicity, we'll use a basic attention implementation
-    // In practice, you'd want to use more optimized kernels
-    
+    // Compute attention scores (simplified)
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     auto attn_output = Tensor::create(ctx, {seq_len, num_heads, head_dim}, DType::FLOAT32);
-    
-    // Simplified attention computation (not optimized)
     for (int h = 0; h < num_heads; ++h) {
-        int kv_h = h % num_kv_heads;  // Handle grouped query attention
-        
+        int kv_h = h % num_kv_heads;  // grouped query attention
         for (int i = 0; i < seq_len; ++i) {
             std::vector<float> scores(seq_len);
-            
-            // Compute attention scores
-            for (int j = 0; j <= i; ++j) {  // Causal mask
+            for (int j = 0; j <= i; ++j) {  // causal mask
                 float score = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
                     float qv = q_reshaped->get_as_float_flat(i * num_heads * head_dim + h * head_dim + d);
@@ -335,8 +327,6 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 }
                 scores[j] = score * scale;
             }
-            
-            // Softmax over scores[0..i]
             float max_score = -1e30f;
             for (int j = 0; j <= i; ++j) max_score = std::max(max_score, scores[j]);
             float sum_exp = 0.0f;
@@ -345,8 +335,6 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 sum_exp += scores[j];
             }
             for (int j = 0; j <= i; ++j) scores[j] /= sum_exp;
-            
-            // Weighted sum of V
             for (int d = 0; d < head_dim; ++d) {
                 float val = 0.0f;
                 for (int j = 0; j <= i; ++j) {
@@ -381,9 +369,62 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
 TensorPtr Expert::forward(const TensorPtr& x) {
     auto ctx = x->ctx.lock();
     if (!ctx) throw std::runtime_error("Expert: ctx expired");
-    // Simple MLP: up -> down (activation omitted for simplicity)
-    auto up = Tensor::matmul_blocked_mt(x, up_proj);
-    auto down = Tensor::matmul_blocked_mt(up, down_proj);
+    // Diagnostics
+    auto print_rank_dims = [&](const char* tag, const TensorPtr& T){
+        if (!T) { std::cout << tag << "=(null)" << std::endl; return; }
+        std::cout << tag << ": rank=" << T->shape.size() << " dims=";
+        for (size_t di=0; di<T->shape.size(); ++di) {
+            std::cout << T->shape[di] << (di+1<T->shape.size()?",":"");
+        }
+        std::cout << std::endl;
+    };
+    print_rank_dims("[MoE] x", x);
+    print_rank_dims("[MoE] gate_proj", gate_proj);
+    print_rank_dims("[MoE] up_proj", up_proj);
+    print_rank_dims("[MoE] down_proj", down_proj);
+    
+    // SwiGLU: (SiLU(gate) * up) -> down
+    TensorPtr inter;
+    if (gate_proj) {
+        auto gate = Tensor::matmul_blocked_mt(x, gate_proj);
+        auto up = Tensor::matmul_blocked_mt(x, up_proj);
+        // sanitize
+        size_t n_g = gate->nelements();
+        for (size_t i = 0; i < n_g; ++i) {
+            float v = gate->get_as_float_flat(i);
+            if (!std::isfinite(v)) gate->set_from_float_flat(i, 0.0f);
+        }
+        size_t n_u = up->nelements();
+        for (size_t i = 0; i < n_u; ++i) {
+            float v = up->get_as_float_flat(i);
+            if (!std::isfinite(v)) up->set_from_float_flat(i, 0.0f);
+        }
+        // SiLU(gate)
+        auto act = Tensor::create(ctx, gate->shape, DType::FLOAT32);
+        for (size_t i = 0; i < n_g; ++i) {
+            float v = gate->get_as_float_flat(i);
+            float sig = 1.0f / (1.0f + std::exp(-v));
+            act->set_from_float_flat(i, v * sig);
+        }
+        // Elementwise mul
+        inter = Tensor::create(ctx, up->shape, DType::FLOAT32);
+        size_t n_i = inter->nelements();
+        for (size_t i = 0; i < n_i; ++i) {
+            inter->set_from_float_flat(i, act->get_as_float_flat(i) * up->get_as_float_flat(i));
+        }
+    } else {
+        auto up = Tensor::matmul_blocked_mt(x, up_proj);
+        size_t n_u = up->nelements();
+        // sanitize and apply SiLU
+        for (size_t i = 0; i < n_u; ++i) {
+            float v = up->get_as_float_flat(i);
+            if (!std::isfinite(v)) v = 0.0f;
+            float sig = 1.0f / (1.0f + std::exp(-v));
+            up->set_from_float_flat(i, v * sig);
+        }
+        inter = up;
+    }
+    auto down = Tensor::matmul_blocked_mt(inter, down_proj);
     return down;
 }
 
@@ -467,43 +508,47 @@ Qwen3VLTextModel::Qwen3VLTextModel(const TensorPtr& embed_tokens,
 TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
     auto ctx = embed_tokens->ctx.lock();
     if (!ctx) throw std::runtime_error("Qwen3VLTextModel: ctx expired");
-    std::cout << "[Forward] Start: input_ids=" << input_ids.size() << std::endl;
-    
-    int seq_len = input_ids.size();
-    // Mark arena to release temporaries after forward
-    size_t arena_mark = ctx->mark();
-    
-    // Embedding lookup
-    auto hidden_states = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
-    std::cout << "[Forward] Alloc hidden_states: shape=[" << seq_len << "," << hidden_size << "]" << std::endl;
-    
-    for (int i = 0; i < seq_len; ++i) {
-        int token_id = input_ids[i];
-        for (int h = 0; h < hidden_size; ++h) {
-            float val = embed_tokens->get_as_float_flat(token_id * hidden_size + h);
-            hidden_states->set_from_float_flat(i * hidden_size + h, val);
-        }
-    }
-    std::cout << "[Forward] Embedding done: seq_len=" << seq_len
-              << " hidden_size=" << hidden_size << std::endl;
-    
-    // Pass through decoder layers
-    for (size_t li = 0; li < layers.size(); ++li) {
-        std::cout << "[Forward] Layer " << li << " start" << std::endl;
-        hidden_states = layers[li]->forward(hidden_states, seq_len);
-        std::cout << "[Forward] Layer " << li << " done" << std::endl;
-    }
-    
-    // Final layer norm
-    hidden_states = norm->forward(hidden_states);
-    std::cout << "[Forward] Final norm done" << std::endl;
+    int seq_len = (int)input_ids.size();
 
-    // Copy result to a fresh tensor and release temporaries to avoid arena growth
+    // embedding lookup into hidden_states [seq_len, hidden_size]
+    auto hidden_states = Tensor::create(ctx, std::vector<int>{seq_len, hidden_size}, DType::FLOAT32);
+    int r0 = embed_tokens->shape[0];
+    int r1 = embed_tokens->shape[1];
+    if (r1 == hidden_size) {
+        for (int i = 0; i < seq_len; ++i) {
+            int tok = input_ids[i];
+            if (tok < 0 || tok >= r0) tok = 0;
+            for (int h = 0; h < hidden_size; ++h) {
+                hidden_states->set_from_float_flat((size_t)i * hidden_size + h,
+                    embed_tokens->get_as_float_flat((size_t)tok * hidden_size + h));
+            }
+        }
+    } else if (r0 == hidden_size) {
+        for (int i = 0; i < seq_len; ++i) {
+            int tok = input_ids[i];
+            if (tok < 0 || tok >= r1) tok = 0;
+            for (int h = 0; h < hidden_size; ++h) {
+                hidden_states->set_from_float_flat((size_t)i * hidden_size + h,
+                    embed_tokens->get_as_float_flat((size_t)h * r1 + tok));
+            }
+        }
+    } else {
+        throw std::runtime_error("Qwen3VLTextModel: cannot infer hidden_size from embed_tokens shape");
+    }
+
+    size_t mark = ctx->mark();
+    
+    // decoder layers
+    for (auto& layer : layers) {
+        hidden_states = layer->forward(hidden_states, seq_len);
+    }
+    
+    // final norm
     auto result = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
     for (size_t i = 0; i < hidden_states->nelements(); ++i) {
         result->set_from_float_flat(i, hidden_states->get_as_float_flat(i));
     }
-    ctx->release_to(arena_mark);
+    ctx->release_to(mark);
     return result;
 }
 
@@ -514,7 +559,7 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     const int num_layers = 48;     // Corrected from config.json
     const int num_heads = 32;
     const int num_kv_heads = 4;
-    const int intermediate_size = 6144;  // Corrected from config.json
+    int intermediate_size = -1;  // infer from weights when available
     const int num_experts = 128;
     const int top_k = 8;
     
@@ -529,6 +574,7 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     if (hidden_size <= 0) {
         throw std::runtime_error("WeightLoader: invalid hidden_size inferred from embed_tokens");
     }
+    std::cout << "[CFG] hidden_size=" << hidden_size << std::endl;
     
     // Build decoder layers
     std::vector<std::shared_ptr<DecoderLayer>> layers;
@@ -573,17 +619,80 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         
         auto gate_weight = ensure_linear_weight_or_transpose(gate_weight_raw, hidden_size);
         
-        // For merged expert weights, we create a simplified expert structure
-        // The actual expert selection and computation will be handled differently
-        std::vector<std::shared_ptr<Expert>> experts;
+        // Diagnostics for MoE weights
+        auto print_shape = [&](const char* tag, const TensorPtr& W){
+            if (!W) { std::cout << tag << "=(null)" << std::endl; return; }
+            std::cout << tag << ": rank=" << W->shape.size() << " dims=";
+            for (size_t di=0; di<W->shape.size(); ++di) {
+                std::cout << W->shape[di] << (di+1<W->shape.size()?",":"");
+            }
+            std::cout << std::endl;
+        };
+        print_shape("[MoE] gate", gate_weight);
+        print_shape("[MoE] experts_gate_up_proj", experts_gate_up_proj);
+        print_shape("[MoE] experts_down_proj", experts_down_proj);
         
-        // Create a single "merged expert" that represents all experts
-        auto merged_expert = std::make_shared<Expert>(
-            experts_gate_up_proj,
-            experts_gate_up_proj,
-            experts_down_proj
-        );
-        experts.push_back(merged_expert);
+        // Build experts: if weights are 3D [E, H, 2I] and [E, I, H], slice per expert and reshape to 2D
+        std::vector<std::shared_ptr<Expert>> experts;
+        if (experts_gate_up_proj && experts_down_proj &&
+            experts_gate_up_proj->shape.size() == 3 && experts_down_proj->shape.size() == 3) {
+            int E = experts_gate_up_proj->shape[0];
+            int H = experts_gate_up_proj->shape[1];
+            int GU = experts_gate_up_proj->shape[2]; // gate+up merged
+            int I_down = experts_down_proj->shape[1];
+            int H_down = experts_down_proj->shape[2];
+            // Infer intermediate_size: prefer down_proj's in-dim; fallback to GU/2
+            int I = I_down;
+            if (I <= 0 || (GU % 2) != 0) I = GU / 2;
+            intermediate_size = (intermediate_size < 0) ? I : intermediate_size;
+            std::cout << "[MoE] Slicing merged experts: E=" << E
+                      << " H=" << H << " GU=" << GU
+                      << " -> inferred I=" << I << " H_down=" << H_down << std::endl;
+            for (int e = 0; e < E; ++e) {
+                // Gate part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
+                auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
+                auto gate_e_3d_contig = gate_e_3d->astype(DType::FLOAT32);
+                auto gate_e = gate_e_3d_contig->reshape_view({H, I});
+                gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
+                
+                // Up part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
+                auto up_e_3d = experts_gate_up_proj->slice_view({e, 0, I}, {1, H, I});
+                auto up_e_3d_contig = up_e_3d->astype(DType::FLOAT32);
+                auto up_e = up_e_3d_contig->reshape_view({H, I});
+                up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
+                
+                // Down part: [1,I,H] -> [I,H]; this slice is contiguous, reshape directly
+                auto down_e_3d = experts_down_proj->slice_view({e, 0, 0}, {1, I, hidden_size});
+                auto down_e = down_e_3d->reshape_view({I, hidden_size});
+                down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
+                
+                experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
+            }
+            std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
+        } else {
+            // Fallback: ensure weights are 2D and build a single expert; infer I from dims
+            int I = -1;
+            if (experts_gate_up_proj && experts_gate_up_proj->shape.size() == 2) {
+                // Orient to [hidden_size, 2I] if needed
+                auto gu_oriented = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
+                int GU = gu_oriented->shape[1];
+                I = GU / 2;
+                // Slice gate/up from 2D by view
+                auto gate_e = gu_oriented->slice_view({0, 0}, {hidden_size, I});
+                auto up_e = gu_oriented->slice_view({0, I}, {hidden_size, I});
+                gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
+                up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
+                // Down oriented to [I, hidden_size]
+                auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, I, hidden_size);
+                experts.push_back(std::make_shared<Expert>(gate_e, up_e, down2d));
+            } else {
+                // If shapes unexpected, just pass through using up/down only
+                auto up2d = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
+                auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, hidden_size);
+                experts.push_back(std::make_shared<Expert>(nullptr, up2d, down2d));
+            }
+            std::cout << "[MoE] Built merged single expert (fallback)" << std::endl;
+        }
         
         // Build MoE block
         auto moe = std::make_shared<SparseMoEBlock>(gate_weight, experts, top_k);
