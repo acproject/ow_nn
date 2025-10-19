@@ -114,6 +114,9 @@ std::vector<std::pair<int, float>> topk_indices_from_logits(const ow::nn::Tensor
     int vocab = logits->shape[1];
     for (int i = 0; i < vocab; ++i) {
         float v = logits->get_as_float_flat(i);
+        if (!std::isfinite(v)) continue;
+        if (v > 100.0f) v = 100.0f;
+        if (v < -100.0f) v = -100.0f;
         if ((int)topk.size() < k) {
             topk.emplace_back(i, v);
             if ((int)topk.size() == k) {
@@ -148,6 +151,10 @@ static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const 
             float b = E->get_as_float_flat(baseE + k);
             acc += a * b;
         }
+        // 简单数值裁剪防止爆炸
+        if (!std::isfinite(acc)) acc = 0.0f;
+        if (acc > 100.0f) acc = 100.0f;
+        if (acc < -100.0f) acc = -100.0f;
         out->set_from_float_flat(j, acc);
     }
     return out;
@@ -162,6 +169,44 @@ static std::string normalize_weight_name(const std::string &name) {
         return normalized;
     }
     return name;
+}
+
+// 规范化 token 字符串：将常见分词标记替换为空格
+static std::string normalize_token_str(std::string s) {
+    const std::string sp_underscore = std::string("\xE2\x96\x81"); // U+2581
+    const std::string gpt_space     = std::string("\xC4\xA0");     // U+0120
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (i + sp_underscore.size() <= s.size() && s.compare(i, sp_underscore.size(), sp_underscore) == 0) {
+            out.push_back(' ');
+            i += sp_underscore.size();
+            continue;
+        }
+        if (i + gpt_space.size() <= s.size() && s.compare(i, gpt_space.size(), gpt_space) == 0) {
+            out.push_back(' ');
+            i += gpt_space.size();
+            continue;
+        }
+        out.push_back(s[i]);
+        ++i;
+    }
+    return out;
+}
+
+// 对 logits 进行 argmax（带数值稳健）
+static int argmax_logits(const ow::nn::TensorPtr &logits) {
+    int V = logits->shape[1];
+    float maxv = -std::numeric_limits<float>::infinity();
+    int maxi = 0;
+    for (int i = 0; i < V; ++i) {
+        float v = logits->get_as_float_flat(i);
+        if (!std::isfinite(v)) continue;
+        if (v > 100.0f) v = 100.0f;
+        if (v < -100.0f) v = -100.0f;
+        if (v > maxv) { maxv = v; maxi = i; }
+    }
+    return maxi;
 }
 
 int main(int argc, char **argv) {
@@ -384,6 +429,8 @@ int main(int argc, char **argv) {
       int max_new_tokens = 64;
       std::string answer;
       int consecutive_empty_tokens = 0;
+      int nextTokenId = -1;
+      bool placeholder = false;
       for (int step = 0; step < max_new_tokens; ++step) {
         auto hidden_states = model->forward(ids);
         
@@ -429,20 +476,32 @@ int main(int argc, char **argv) {
         // Optional: print top-5 for debugging
         auto top5 = topk_indices_from_logits(logits, 5);
         std::cout << "[DBG top-5] ";
-        for (auto &p : top5) std::cout << "(" << p.first << ":" << p.second << ") ";
+        for (const auto &p : top5) { std::cout << "(" << p.first << ":" << p.second << ") "; }
         std::cout << "\n";
 
-        auto next = std::max_element(top5.begin(), top5.end(), [](auto &a, auto &b){return a.second < b.second;});
-        int next_id = next->first;
-        ids.push_back(next_id);
-        std::string piece = tok.decode({next_id});
+        // 选择下一个 token：全量 argmax（更稳健）
+        nextTokenId = argmax_logits(logits);
+        ids.push_back(nextTokenId);
+
+        // 解码并规范化
+        std::string piece_raw = tok.decode_id(nextTokenId);
+        std::string piece = normalize_token_str(piece_raw);
+
+        // EOS 停止条件
+        if (piece == "</s>" || piece == "<|endoftext|>" || piece == "<|im_end|>") {
+          std::cout << "\n[GEN] EOS reached." << std::endl;
+          break;
+        }
+
+        // 输出并累积
         std::cout << piece << std::flush;
         answer += piece;
 
-        // Check for consecutive empty or problematic tokens
-        if (piece.empty() || piece == " " || piece == "\t") {
+        // 检查连续空白/不可打印（但未知占位符不记入空白）
+        placeholder = piece.size() >= 4 && piece.find("<id=") != std::string::npos;
+        if (!placeholder && (piece.empty() || piece == " " || piece == "\t")) {
           consecutive_empty_tokens++;
-          if (consecutive_empty_tokens > 10) {
+          if (consecutive_empty_tokens > 20) {
             std::cerr << "[WARNING] Too many consecutive empty tokens, stopping generation" << std::endl;
             break;
           }
@@ -450,7 +509,7 @@ int main(int argc, char **argv) {
           consecutive_empty_tokens = 0;
         }
 
-        if (!piece.empty() && piece.back() == '\n') break;
+        if (!piece.empty() && piece.back() == '\n') { break; }
       }
       std::cout << std::endl;
       history.emplace_back(question, answer);

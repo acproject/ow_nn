@@ -20,6 +20,12 @@ public:
   // 解码：ids -> text（尽力而为）
   std::string decode(const std::vector<int> &ids) const;
 
+  // 新增：检查某个 id 是否可解码（在 vocab 或 OOV 映射中）
+  bool has_id(int id) const;
+
+  // 新增：解码单个 id；若未知则返回占位符，例如 "<id=123>"
+  std::string decode_id(int id) const;
+
 private:
   // pair<string,string> 的哈希
   struct PairHash {

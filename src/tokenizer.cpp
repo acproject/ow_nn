@@ -183,4 +183,26 @@ std::string Tokenizer::decode(const std::vector<int> &ids) const {
   return oss.str();
 }
 
+// 新增：检查 id 是否存在
+bool Tokenizer::has_id(int id) const {
+  if (id == kSpaceId) return true;
+  if (inv_vocab_.find(id) != inv_vocab_.end()) return true;
+  if (inv_oov_map_.find(id) != inv_oov_map_.end()) return true;
+  return false;
+}
+
+// 新增：解码单个 id（若未知则返回占位符）
+std::string Tokenizer::decode_id(int id) const {
+  if (id == kSpaceId) return std::string(" ");
+  if (auto it = inv_vocab_.find(id); it != inv_vocab_.end()) {
+    return it->second;
+  }
+  if (auto oit = inv_oov_map_.find(id); oit != inv_oov_map_.end()) {
+    return oit->second;
+  }
+  std::ostringstream oss;
+  oss << "<id=" << id << ">";
+  return oss.str();
+}
+
 } // namespace ow::nn
