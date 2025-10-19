@@ -194,6 +194,20 @@ MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr&
     q_norm = std::make_shared<RMSNorm>(q_norm_weight);
     k_norm = std::make_shared<RMSNorm>(k_norm_weight);
     rotary_emb = std::make_shared<RotaryEmbedding>(head_dim);
+
+    // KV cache state
+    cache_len = 0;
+    max_seq_len = 0;
+}
+
+// Initialize KV cache (persistent across forwards)
+void MultiHeadAttention::init_cache(const std::shared_ptr<Context>& ctx, int max_len) {
+    if (!ctx) throw std::runtime_error("MultiHeadAttention::init_cache: ctx expired");
+    if (max_len <= 0) max_len = 2048;
+    max_seq_len = max_len;
+    k_cache = Tensor::create(ctx, {max_seq_len, num_kv_heads, head_dim}, DType::FLOAT32);
+    v_cache = Tensor::create(ctx, {max_seq_len, num_kv_heads, head_dim}, DType::FLOAT32);
+    cache_len = 0;
 }
 
 TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_len) {
@@ -207,6 +221,17 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
               << " v_proj.dtype=" << (int)v_proj->dtype
               << std::endl;
 
+    // Ensure KV cache is initialized and persistent
+    if (!k_cache || !v_cache) {
+        init_cache(ctx, std::max(seq_len, rotary_emb->max_seq_len));
+        std::cout << "[KV] Initialized cache: max_seq_len=" << max_seq_len << std::endl;
+    }
+    // Reset cache when sequence length shrinks (new prompt)
+    if (seq_len < cache_len) {
+        std::cout << "[KV] Reset cache_len from " << cache_len << " to 0 (new prompt)" << std::endl;
+        cache_len = 0;
+    }
+
     // Print a slice of hidden_states row 0
     int hs_print = std::min(hidden_size, 8);
     std::cout << "[MHA] hidden_states[0,:" << hs_print << "]: ";
@@ -215,23 +240,11 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     }
     std::cout << std::endl;
     
-    // Print a slice of v_proj first row
-    int vp_cols = v_proj->shape[1];
-    int vp_print = std::min(vp_cols, 8);
-    std::cout << "[MHA] v_proj[0,:" << vp_print << "]: ";
-    for (int j = 0; j < vp_print; ++j) {
-        std::cout << v_proj->get_as_float_flat(0 * vp_cols + j) << (j+1<vp_print?",":"");
-    }
-    std::cout << std::endl;
-    
     // hidden_states: [seq_len, hidden_size]
-    // Project to Q, K, V
+    // Project Q for all tokens (kept simple); K/V update incrementally using cache
     auto q = Tensor::matmul_cache_friendly(hidden_states, q_proj);
-    auto k = Tensor::matmul_cache_friendly(hidden_states, k_proj);
-    // Use scalar fallback for v to validate kernel correctness on narrow N
-    auto v = Tensor::matmul_blocked_mt(hidden_states, v_proj, /*block_m*/64, /*block_n*/1, /*block_k*/64, /*nthreads*/1);
-    
-    // Sanitize possible NaN/Inf produced by FP8 conversion or matmul
+
+    // Sanitize possible NaN/Inf produced by conversions or matmul
     auto sanitize_tensor = [](const TensorPtr& t, const std::string& name = "") {
         if (!t) return;
         size_t n = t->nelements();
@@ -243,7 +256,7 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 t->set_from_float_flat(i, 0.0f);
             } else if (std::isinf(v)) {
                 inf_count++;
-                t->set_from_float_flat(i, std::copysign(1e6f, v)); // Clamp to large but finite value
+                t->set_from_float_flat(i, std::copysign(1e6f, v));
             }
         }
         if (nan_count > 0 || inf_count > 0) {
@@ -252,90 +265,69 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
         }
     };
     sanitize_tensor(q, "q_proj");
-    sanitize_tensor(k, "k_proj");
-    sanitize_tensor(v, "v_proj");
-    
-    // Print raw q/k/v of position 0 before reshape
-    int q_print = std::min(q->shape[1], 8);
-    int kv_print = std::min(v->shape[1], 8);
-    std::cout << "[MHA] raw q[0,:" << q_print << "]: ";
-    for (int d = 0; d < q_print; ++d) {
-        std::cout << q->get_as_float_flat(0 * q->shape[1] + d) << (d+1<q_print?",":"");
-    }
-    std::cout << std::endl;
-    std::cout << "[MHA] raw k[0,:" << kv_print << "]: ";
-    for (int d = 0; d < kv_print; ++d) {
-        std::cout << k->get_as_float_flat(0 * k->shape[1] + d) << (d+1<kv_print?",":"");
-    }
-    std::cout << std::endl;
-    std::cout << "[MHA] raw v[0,:" << kv_print << "]: ";
-    for (int d = 0; d < kv_print; ++d) {
-        std::cout << v->get_as_float_flat(0 * v->shape[1] + d) << (d+1<kv_print?",":"");
-    }
-    std::cout << std::endl;
 
-    // Compute simple max-abs for v
-    float vmax = 0.0f;
-    for (int i = 0; i < v->shape[0]; ++i) {
-        for (int j = 0; j < v->shape[1]; ++j) {
-            float val = v->get_as_float_flat((size_t)i * v->shape[1] + j);
-            vmax = std::max(vmax, std::fabs(val));
+    // Reshape Q and apply RMSNorm + RoPE
+    auto q_reshaped = q->reshape_view({seq_len, num_heads, head_dim});
+    q_reshaped = q_norm->forward(q_reshaped);
+    auto [cos, sin] = rotary_emb->forward(seq_len, ctx);
+    q_reshaped = rotary_emb->apply_rotary_pos_emb(q_reshaped, cos, sin);
+
+    // Incrementally compute K/V for new tokens and update caches (normalized + RoPE K, raw V)
+    int start = cache_len;
+    for (int i = start; i < seq_len; ++i) {
+        // slice current token
+        auto x_i = hidden_states->slice_view({i, 0}, {1, hidden_size});
+        // matvec for K and V (panel packing + blocking)
+        auto k_i = Tensor::matvec_blocked_mt(x_i, k_proj);
+        auto v_i = Tensor::matvec_blocked_mt(x_i, v_proj);
+        sanitize_tensor(k_i, "k_proj[i]");
+        sanitize_tensor(v_i, "v_proj[i]");
+        // reshape to [1, num_kv_heads, head_dim]
+        auto k_i_r = k_i->reshape_view({1, num_kv_heads, head_dim});
+        auto v_i_r = v_i->reshape_view({1, num_kv_heads, head_dim});
+        // k-norm
+        k_i_r = k_norm->forward(k_i_r);
+        // Apply RoPE manually for position i and store to cache
+        for (int h = 0; h < num_kv_heads; ++h) {
+            for (int d = 0; d < head_dim; d += 2) {
+                size_t src1 = 0 * num_kv_heads * head_dim + h * head_dim + d;
+                float x1 = k_i_r->get_as_float_flat(src1);
+                float x2 = k_i_r->get_as_float_flat(src1 + 1);
+                size_t cos_idx = (size_t)i * (head_dim / 2) + (size_t)(d / 2);
+                float cos_val = cos->get_as_float_flat(cos_idx);
+                float sin_val = sin->get_as_float_flat(cos_idx);
+                float new_x1 = x1 * cos_val - x2 * sin_val;
+                float new_x2 = x1 * sin_val + x2 * cos_val;
+                size_t dst1 = (size_t)i * num_kv_heads * head_dim + (size_t)h * head_dim + d;
+                k_cache->set_from_float_flat(dst1, new_x1);
+                k_cache->set_from_float_flat(dst1 + 1, new_x2);
+            }
+        }
+        // Store V to cache
+        for (int h = 0; h < num_kv_heads; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                float vv = v_i_r->get_as_float_flat(0 * num_kv_heads * head_dim + h * head_dim + d);
+                size_t dst = (size_t)i * num_kv_heads * head_dim + (size_t)h * head_dim + d;
+                v_cache->set_from_float_flat(dst, vv);
+            }
         }
     }
-    std::cout << "[MHA] v max|val|=" << vmax << std::endl;
-    
-    // Reshape to [seq_len, num_heads, head_dim]
-    auto q_reshaped = q->reshape_view({seq_len, num_heads, head_dim});
-    auto k_reshaped = k->reshape_view({seq_len, num_kv_heads, head_dim});
-    auto v_reshaped = v->reshape_view({seq_len, num_kv_heads, head_dim});
-    std::cout << "[MHA] Matmul done: q=[" << q->shape[0] << "," << q->shape[1]
-              << "] k=[" << k->shape[0] << "," << k->shape[1]
-              << "] v=[" << v->shape[0] << "," << v->shape[1] << "]" << std::endl;
-    
-    // Apply RMSNorm to Q and K
-    std::cout << "[MHA] Pre-norm shapes: q_r=[" << q_reshaped->shape[0] << "," << q_reshaped->shape[1] << "," << q_reshaped->shape[2]
-              << "] k_r=[" << k_reshaped->shape[0] << "," << k_reshaped->shape[1] << "," << k_reshaped->shape[2] << "]" << std::endl;
-    q_reshaped = q_norm->forward(q_reshaped);
-    k_reshaped = k_norm->forward(k_reshaped);
-    std::cout << "[MHA] Post-norm" << std::endl;
-    
-    // Apply rotary position embedding
-    auto [cos, sin] = rotary_emb->forward(seq_len, ctx);
-    std::cout << "[MHA] Rotary forward: cos=[" << cos->shape[0] << "," << cos->shape[1] << "]" << std::endl;
-    try {
-        q_reshaped = rotary_emb->apply_rotary_pos_emb(q_reshaped, cos, sin);
-        std::cout << "[MHA] RoPE applied to Q" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[MHA] RoPE apply failed for Q: " << e.what() << std::endl;
-        throw;
-    }
-    try {
-        k_reshaped = rotary_emb->apply_rotary_pos_emb(k_reshaped, cos, sin);
-        std::cout << "[MHA] RoPE applied to K" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[MHA] RoPE apply failed for K: " << e.what() << std::endl;
-        throw;
-    }
-    std::cout << "[MHA] Rotary applied" << std::endl;
-    
-    // Debug: print first few q/k/v values after norm+RoPE for i=0,h=0
-    std::cout << "[MHA] q[0,0,:]: ";
-    for (int d=0; d<head_dim; ++d) {
-        std::cout << q_reshaped->get_as_float_flat(0 * num_heads * head_dim + 0 * head_dim + d) << (d+1<head_dim?",":"");
+    cache_len = seq_len;
+
+    // Debug: print first few K/V cache values at position 0
+    int kv_print = std::min(head_dim, 8);
+    std::cout << "[KV] k_cache[0,0,:]: ";
+    for (int d = 0; d < kv_print; ++d) {
+        std::cout << k_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
     }
     std::cout << std::endl;
-    std::cout << "[MHA] k[0,0,:]: ";
-    for (int d=0; d<head_dim; ++d) {
-        std::cout << k_reshaped->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<head_dim?",":"");
-    }
-    std::cout << std::endl;
-    std::cout << "[MHA] v[0,0,:]: ";
-    for (int d=0; d<head_dim; ++d) {
-        std::cout << v_reshaped->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<head_dim?",":"");
+    std::cout << "[KV] v_cache[0,0,:]: ";
+    for (int d = 0; d < kv_print; ++d) {
+        std::cout << v_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
     }
     std::cout << std::endl;
     
-    // Compute attention scores (simplified) with improved numerical stability
+    // Compute attention scores with improved numerical stability using cached K/V
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     auto attn_output = Tensor::create(ctx, {seq_len, num_heads, head_dim}, DType::FLOAT32);
     for (int h = 0; h < num_heads; ++h) {
@@ -346,30 +338,24 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 float score = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
                     float qv = q_reshaped->get_as_float_flat(i * num_heads * head_dim + h * head_dim + d);
-                    float kvv = k_reshaped->get_as_float_flat(j * num_kv_heads * head_dim + kv_h * head_dim + d);
-                    // 添加数值稳定性检查
+                    float kvv = k_cache->get_as_float_flat(j * num_kv_heads * head_dim + kv_h * head_dim + d);
                     if (!std::isfinite(qv)) qv = 0.0f;
                     if (!std::isfinite(kvv)) kvv = 0.0f;
                     score += qv * kvv;
                 }
-                // 应用缩放并进行数值裁剪
                 score *= scale;
-                // 更严格的数值裁剪，防止softmax溢出
                 if (!std::isfinite(score)) score = -50.0f;
                 if (score > 50.0f) score = 50.0f;
                 if (score < -50.0f) score = -50.0f;
                 scores[j] = score;
             }
-            // 改进的softmax数值稳定性
             float max_score = -std::numeric_limits<float>::infinity();
             for (int j = 0; j <= i; ++j) {
                 if (std::isfinite(scores[j])) {
                     max_score = std::max(max_score, scores[j]);
                 }
             }
-            // 如果所有分数都不是有限的，使用默认值
             if (!std::isfinite(max_score)) max_score = 0.0f;
-            
             float sum_exp = 0.0f;
             for (int j = 0; j <= i; ++j) {
                 float exp_val = std::exp(scores[j] - max_score);
@@ -377,13 +363,12 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 scores[j] = exp_val;
                 sum_exp += exp_val;
             }
-            // 防止除零
             if (sum_exp <= 1e-10f) sum_exp = 1.0f;
             for (int j = 0; j <= i; ++j) scores[j] /= sum_exp;
             for (int d = 0; d < head_dim; ++d) {
                 float val = 0.0f;
                 for (int j = 0; j <= i; ++j) {
-                    val += scores[j] * v_reshaped->get_as_float_flat(j * num_kv_heads * head_dim + kv_h * head_dim + d);
+                    val += scores[j] * v_cache->get_as_float_flat(j * num_kv_heads * head_dim + kv_h * head_dim + d);
                 }
                 attn_output->set_from_float_flat(i * num_heads * head_dim + h * head_dim + d, val);
             }
@@ -393,11 +378,10 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     // Reshape back and project output
     auto attn_flat = attn_output->reshape_view({seq_len, num_heads * head_dim});
     auto out = Tensor::matmul_cache_friendly(attn_flat, o_proj);
-    // Sanitize potential NaNs from FP8 matmul
     sanitize_tensor(out, "o_proj");
      
-     // Debug: print a slice of attn_flat and out
-     int out_print = std::min(num_heads * head_dim, 8);
+    // Debug: print a slice of attn_flat and out
+    int out_print = std::min(num_heads * head_dim, 8);
     std::cout << "[MHA] attn_flat[0,:" << out_print << "]: ";
     for (int d = 0; d < out_print; ++d) {
         std::cout << attn_flat->get_as_float_flat(0 * (num_heads * head_dim) + d) << (d+1<out_print?",":"");
@@ -553,6 +537,15 @@ Qwen3VLTextModel::Qwen3VLTextModel(const TensorPtr& embed_tokens,
       num_heads(num_heads), num_kv_heads(num_kv_heads) {
     
     rotary_emb = std::make_shared<RotaryEmbedding>(hidden_size / num_heads);
+    // Initialize KV caches for each layer to persist across forwards
+    auto ctx = embed_tokens->ctx.lock();
+    if (ctx) {
+        for (auto &layer : layers) {
+            if (layer && layer->self_attn) {
+                layer->self_attn->init_cache(ctx, rotary_emb->max_seq_len);
+            }
+        }
+    }
 }
 
 TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
@@ -598,6 +591,9 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
     for (auto& layer : layers) {
         hidden_states = layer->forward(hidden_states, seq_len);
     }
+    
+    // Apply final RMSNorm before output
+    hidden_states = norm->forward(hidden_states);
     
     // final norm
     auto result = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);

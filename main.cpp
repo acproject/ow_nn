@@ -230,14 +230,8 @@ static int argmax_logits(const ow::nn::TensorPtr &logits) {
     
     for (int i = 0; i < V; ++i) {
         float v = logits->get_as_float_flat(i);
-        
         // 跳过非有限值
         if (!std::isfinite(v)) continue;
-        
-        // 与matvec_rows_dot保持一致的裁剪范围
-        if (v > 50.0f) v = 50.0f;
-        if (v < -50.0f) v = -50.0f;
-        
         valid_count++;
         if (v > maxv) { 
             maxv = v; 
@@ -502,7 +496,7 @@ int main(int argc, char **argv) {
         if (!vocab_weight) vocab_weight = wl.get_weight("model.embed_tokens.weight");
         if (!vocab_weight) throw std::runtime_error("No vocab projection weight found");
 
-        auto logits = matvec_rows_dot(last_hidden, vocab_weight);
+        auto logits = ow::nn::Tensor::matvec_blocked_mt(last_hidden, vocab_weight);
         
         // Check for NaN in logits
         has_nan = false;

@@ -55,11 +55,20 @@ public:
     int num_kv_heads;
     int head_dim;
     int hidden_size;
+
+    // KV Cache
+    TensorPtr k_cache;
+    TensorPtr v_cache;
+    int cache_len;
+    int max_seq_len;
     
     MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr& k_proj, 
                       const TensorPtr& v_proj, const TensorPtr& o_proj,
                       const TensorPtr& q_norm_weight, const TensorPtr& k_norm_weight,
                       int num_heads, int num_kv_heads, int hidden_size);
+    
+    // Initialize KV cache (persistent across forwards)
+    void init_cache(const std::shared_ptr<Context>& ctx, int max_seq_len);
     
     TensorPtr forward(const TensorPtr& hidden_states, int seq_len);
 };
