@@ -246,7 +246,7 @@ public:
   // flattened access helpers
   // FP8 decode helpers (E4M3, E5M2)
   static inline float fp8_e4m3_to_f32(uint8_t x) {
-    uint8_t sign = x >> 7;
+    uint8_t sign = (x >> 7) & 0x1;
     uint8_t exp = (x >> 3) & 0x0F;
     uint8_t mant = x & 0x07;
     const int bias = 7;
@@ -254,25 +254,20 @@ public:
       if (mant == 0) return sign ? -0.0f : 0.0f;
       float m = mant / 8.0f;
       float val = std::ldexp(m, 1 - bias);
-      // Clamp subnormal values to prevent accumulation issues
-      if (val > 1e-6f) val = 1e-6f;
-      else if (val < -1e-6f) val = -1e-6f;
       return sign ? -val : val;
     } else if (exp == 0x0F) {
-      // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
-      return 0.0f;
+      // Inf / NaN
+      if (mant == 0) return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+      return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 8.0f;
       int E = (int)exp - bias;
       float val = std::ldexp(m, E);
-      // Strict clamping to prevent numerical explosion
-      if (!std::isfinite(val) || val > 10.0f) val = 10.0f;
-      else if (val < -10.0f) val = -10.0f;
       return sign ? -val : val;
     }
   }
   static inline float fp8_e5m2_to_f32(uint8_t x) {
-    uint8_t sign = x >> 7;
+    uint8_t sign = (x >> 7) & 0x1;
     uint8_t exp = (x >> 2) & 0x1F;
     uint8_t mant = x & 0x03;
     const int bias = 15;
@@ -280,21 +275,15 @@ public:
       if (mant == 0) return sign ? -0.0f : 0.0f;
       float m = mant / 4.0f;
       float val = std::ldexp(m, 1 - bias);
-      // Clamp subnormal values to prevent accumulation issues
-      if (val > 1e-6f) val = 1e-6f;
-      else if (val < -1e-6f) val = -1e-6f;
       return sign ? -val : val;
     } else if (exp == 0x1F) {
-      // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
-      return 0.0f;
+      // Inf / NaN
+      if (mant == 0) return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+      return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 4.0f;
       int E = (int)exp - bias;
       float val = std::ldexp(m, E);
-      // CRITICAL: FP8_E5M2 can produce very large values (up to ~57344)
-      // Strict clamping to prevent numerical explosion in matrix multiplication
-      if (!std::isfinite(val) || val > 10.0f) val = 10.0f;
-      else if (val < -10.0f) val = -10.0f;
       return sign ? -val : val;
     }
   }
