@@ -553,6 +553,12 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
     if (!ctx) throw std::runtime_error("Qwen3VLTextModel: ctx expired");
     int seq_len = (int)input_ids.size();
 
+    // Pre-allocate result before mark so it survives release_to(mark)
+    auto result = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
+
+    // Base mark for the whole forward; reclaim everything allocated after it at the end
+    size_t mark = ctx->mark();
+
     // embedding lookup into hidden_states [seq_len, hidden_size]
     auto hidden_states = Tensor::create(ctx, std::vector<int>{seq_len, hidden_size}, DType::FLOAT32);
     int r0 = embed_tokens->shape[0];
@@ -585,18 +591,29 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
         if (!std::isfinite(v)) hidden_states->set_from_float_flat(i, 0.0f);
     }
 
-    size_t mark = ctx->mark();
+    // Allocate ping-pong buffers for per-layer outputs (kept across per-layer releases)
+    auto ping = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
+    auto pong = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
+    bool use_ping = true;
     
-    // decoder layers
+    // decoder layers with per-layer mark/release
     for (auto& layer : layers) {
-        hidden_states = layer->forward(hidden_states, seq_len);
+        size_t lmark = ctx->mark();
+        auto out_tmp = layer->forward(hidden_states, seq_len);
+        auto target = use_ping ? ping : pong;
+        // copy layer output into ping/pong buffer
+        for (size_t i = 0; i < out_tmp->nelements(); ++i) {
+            target->set_from_float_flat(i, out_tmp->get_as_float_flat(i));
+        }
+        ctx->release_to(lmark);
+        hidden_states = target;
+        use_ping = !use_ping;
     }
     
     // Apply final RMSNorm before output
     hidden_states = norm->forward(hidden_states);
     
-    // final norm
-    auto result = Tensor::create(ctx, {seq_len, hidden_size}, DType::FLOAT32);
+    // Copy normalized hidden_states into result, then release temporaries
     for (size_t i = 0; i < hidden_states->nelements(); ++i) {
         result->set_from_float_flat(i, hidden_states->get_as_float_flat(i));
     }

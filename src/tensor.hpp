@@ -762,8 +762,8 @@ public:
 #endif
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
-                float* acc = static_cast<float*>(ctx->scratch_alloc(width * sizeof(float)));
-                std::fill(acc, acc + width, 0.0f);
+                float acc_buf[8];
+                for (int l = 0; l < width; ++l) acc_buf[l] = 0.0f;
                 
                 for (int p = 0; p < k_len; ++p) {
                   float a = fastA ? Arow[p]
@@ -771,13 +771,13 @@ public:
                   if (!std::isfinite(a)) a = 0.0f;
                   const float *bvec = pack + p * W;
                   for (int l = 0; l < width; ++l) {
-                    acc[l] += a * bvec[l];
+                    acc_buf[l] += a * bvec[l];
                   }
                 }
                 for (int l = 0; l < width; ++l) {
                   size_t ri = (size_t)ii * n + (jpanel + l);
                   float prev = R->get_as_float_flat(ri);
-                  R->set_from_float_flat(ri, prev + acc[l]);
+                  R->set_from_float_flat(ri, prev + acc_buf[l]);
                 }
               }
             }
@@ -862,9 +862,8 @@ public:
 #endif
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
-                // Use scratch buffer for accumulator too
-                float* acc = static_cast<float*>(ctx->scratch_alloc(width * sizeof(float)));
-                std::fill(acc, acc + width, 0.0f);
+                float acc_buf[8];
+                for (int l = 0; l < width; ++l) acc_buf[l] = 0.0f;
                 
                 for (int p = 0; p < k_len; ++p) {
                   float a = fastA ? Arow[p]
@@ -872,13 +871,13 @@ public:
                   if (!std::isfinite(a)) a = 0.0f;
                   const float *bvec = pack + p * W;
                   for (int l = 0; l < width; ++l) {
-                    acc[l] += a * bvec[l];
+                    acc_buf[l] += a * bvec[l];
                   }
                 }
                 for (int l = 0; l < width; ++l) {
                   size_t ri = (size_t)ii * n + (jpanel + l);
                   float prev = R->get_as_float_flat(ri);
-                  R->set_from_float_flat(ri, prev + acc[l]);
+                  R->set_from_float_flat(ri, prev + acc_buf[l]);
                 }
               }
             }

@@ -21,6 +21,7 @@ public:
     arena.resize(arena_size);
     offset = 0;
     // initialize scratch buffer to a smaller default; grows on demand
+    // NOTE: legacy shared scratch is kept but unused after TLS migration
     scratch.resize(512 * 1024);
     scratch_offset = 0;
   }
@@ -109,6 +110,20 @@ private:
 #endif
   }
 
+  // Thread-local scratch buffer state
+  struct ThreadScratch {
+    std::vector<uint8_t> buf;
+    size_t offset = 0;
+  };
+  static ThreadScratch& get_tls_scratch() {
+    thread_local ThreadScratch ts;
+    if (ts.buf.empty()) {
+      ts.buf.resize(512 * 1024);
+      ts.offset = 0;
+    }
+    return ts;
+  }
+
 public:
   // mark current arena pointer, for simple LIFO lifetime management
   size_t mark() const { return offset; }
@@ -124,11 +139,11 @@ public:
   size_t capacity() const { return arena.size(); }
 
   // Enhanced scratch buffer for temporary allocations inside kernels.
-  // Intended for short-lived intermediates (e.g., packed panels).
-  // Pre-allocates common sizes to avoid frequent resizing.
+  // Thread-safe via thread-local storage. Intended for short-lived intermediates.
   void *scratch_alloc(size_t bytes) {
-    size_t cur = align_up(scratch_offset, align_bytes);
-    if (cur + bytes > scratch.size()) {
+    auto &ts = get_tls_scratch();
+    size_t cur = align_up(ts.offset, align_bytes);
+    if (cur + bytes > ts.buf.size()) {
       // Pre-allocate larger chunks for common matrix operations
       size_t min_growth = 16 * 1024 * 1024; // 16MB minimum growth
       size_t needed = cur + bytes;
@@ -143,12 +158,12 @@ public:
       }
       
       std::cout << "[Context] Resize scratch buffer from " 
-                << (scratch.size() / (1024.0 * 1024.0)) << " MB to " 
+                << (ts.buf.size() / (1024.0 * 1024.0)) << " MB to " 
                 << (new_size / (1024.0 * 1024.0)) << " MB" << std::endl;
-      scratch.resize(new_size);
+      ts.buf.resize(new_size);
     }
-    void *ptr = scratch.data() + cur;
-    scratch_offset = cur + bytes;
+    void *ptr = ts.buf.data() + cur;
+    ts.offset = cur + bytes;
     return ptr;
   }
   
@@ -160,14 +175,15 @@ public:
     return scratch_alloc(aligned_bytes);
   }
   
-  void scratch_reset() { scratch_offset = 0; }
-  size_t scratch_used() const { return scratch_offset; }
-  size_t scratch_capacity() const { return scratch.size(); }
+  void scratch_reset() { auto &ts = get_tls_scratch(); ts.offset = 0; }
+  size_t scratch_used() const { return get_tls_scratch().offset; }
+  size_t scratch_capacity() const { return get_tls_scratch().buf.size(); }
 
 private:
   std::vector<uint8_t> arena;
   size_t offset = 0;
   size_t align_bytes = 64;
+  // legacy shared scratch (unused after TLS migration, kept to avoid breaking ABI)
   std::vector<uint8_t> scratch;
   size_t scratch_offset = 0;
 };
