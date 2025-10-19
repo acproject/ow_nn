@@ -31,6 +31,21 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # 子目录
 add_subdirectory(src)
 
+# Add benchmark executable
+add_executable(benchmark_matmul benchmark_matmul.cpp)
+target_compile_features(benchmark_matmul PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(benchmark_matmul PRIVATE /arch:AVX2 /openmp)
+    set_target_properties(benchmark_matmul PROPERTIES
+        COMPILE_FLAGS_RELEASE "/O2"
+        COMPILE_FLAGS_DEBUG "/Od"
+    )
+else()
+    target_compile_options(benchmark_matmul PRIVATE -O3 -march=native -fopenmp)
+    target_link_libraries(benchmark_matmul PRIVATE -fopenmp)
+endif()
+target_include_directories(benchmark_matmul PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # 主程序可执行
 add_executable(ow_nn_main ${CMAKE_SOURCE_DIR}/main.cpp)
 target_link_libraries(ow_nn_main PRIVATE ow_nn)

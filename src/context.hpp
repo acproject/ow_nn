@@ -123,20 +123,46 @@ public:
 
   size_t capacity() const { return arena.size(); }
 
-  // Scratch buffer for temporary allocations inside kernels.
+  // Enhanced scratch buffer for temporary allocations inside kernels.
   // Intended for short-lived intermediates (e.g., packed panels).
+  // Pre-allocates common sizes to avoid frequent resizing.
   void *scratch_alloc(size_t bytes) {
     size_t cur = align_up(scratch_offset, align_bytes);
     if (cur + bytes > scratch.size()) {
-      size_t new_size = std::max(scratch.size() * 2, cur + bytes);
+      // Pre-allocate larger chunks for common matrix operations
+      size_t min_growth = 16 * 1024 * 1024; // 16MB minimum growth
+      size_t needed = cur + bytes;
+      size_t new_size;
+      
+      if (needed < 64 * 1024 * 1024) { // < 64MB
+        new_size = std::max(needed * 2, min_growth);
+      } else if (needed < 512 * 1024 * 1024) { // < 512MB
+        new_size = needed + 128 * 1024 * 1024; // +128MB
+      } else {
+        new_size = needed + 64 * 1024 * 1024; // +64MB for very large
+      }
+      
+      std::cout << "[Context] Resize scratch buffer from " 
+                << (scratch.size() / (1024.0 * 1024.0)) << " MB to " 
+                << (new_size / (1024.0 * 1024.0)) << " MB" << std::endl;
       scratch.resize(new_size);
     }
     void *ptr = scratch.data() + cur;
     scratch_offset = cur + bytes;
     return ptr;
   }
+  
+  // Optimized allocation for matrix packing (common use case)
+  void *scratch_alloc_matrix_pack(size_t rows, size_t cols, size_t elem_size = sizeof(float)) {
+    size_t bytes = rows * cols * elem_size;
+    // Align to cache line boundaries for better performance
+    size_t aligned_bytes = align_up(bytes, 64);
+    return scratch_alloc(aligned_bytes);
+  }
+  
   void scratch_reset() { scratch_offset = 0; }
   size_t scratch_used() const { return scratch_offset; }
+  size_t scratch_capacity() const { return scratch.size(); }
 
 private:
   std::vector<uint8_t> arena;

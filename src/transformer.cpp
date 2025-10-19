@@ -226,8 +226,8 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     
     // hidden_states: [seq_len, hidden_size]
     // Project to Q, K, V
-    auto q = Tensor::matmul_blocked_mt(hidden_states, q_proj);
-    auto k = Tensor::matmul_blocked_mt(hidden_states, k_proj);
+    auto q = Tensor::matmul_cache_friendly(hidden_states, q_proj);
+    auto k = Tensor::matmul_cache_friendly(hidden_states, k_proj);
     // Use scalar fallback for v to validate kernel correctness on narrow N
     auto v = Tensor::matmul_blocked_mt(hidden_states, v_proj, /*block_m*/64, /*block_n*/1, /*block_k*/64, /*nthreads*/1);
     
@@ -335,7 +335,7 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     }
     std::cout << std::endl;
     
-    // Compute attention scores (simplified)
+    // Compute attention scores (simplified) with improved numerical stability
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     auto attn_output = Tensor::create(ctx, {seq_len, num_heads, head_dim}, DType::FLOAT32);
     for (int h = 0; h < num_heads; ++h) {
@@ -347,17 +347,38 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
                 for (int d = 0; d < head_dim; ++d) {
                     float qv = q_reshaped->get_as_float_flat(i * num_heads * head_dim + h * head_dim + d);
                     float kvv = k_reshaped->get_as_float_flat(j * num_kv_heads * head_dim + kv_h * head_dim + d);
+                    // 添加数值稳定性检查
+                    if (!std::isfinite(qv)) qv = 0.0f;
+                    if (!std::isfinite(kvv)) kvv = 0.0f;
                     score += qv * kvv;
                 }
-                scores[j] = score * scale;
+                // 应用缩放并进行数值裁剪
+                score *= scale;
+                // 更严格的数值裁剪，防止softmax溢出
+                if (!std::isfinite(score)) score = -50.0f;
+                if (score > 50.0f) score = 50.0f;
+                if (score < -50.0f) score = -50.0f;
+                scores[j] = score;
             }
-            float max_score = -1e30f;
-            for (int j = 0; j <= i; ++j) max_score = std::max(max_score, scores[j]);
+            // 改进的softmax数值稳定性
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int j = 0; j <= i; ++j) {
+                if (std::isfinite(scores[j])) {
+                    max_score = std::max(max_score, scores[j]);
+                }
+            }
+            // 如果所有分数都不是有限的，使用默认值
+            if (!std::isfinite(max_score)) max_score = 0.0f;
+            
             float sum_exp = 0.0f;
             for (int j = 0; j <= i; ++j) {
-                scores[j] = std::exp(scores[j] - max_score);
-                sum_exp += scores[j];
+                float exp_val = std::exp(scores[j] - max_score);
+                if (!std::isfinite(exp_val)) exp_val = 0.0f;
+                scores[j] = exp_val;
+                sum_exp += exp_val;
             }
+            // 防止除零
+            if (sum_exp <= 1e-10f) sum_exp = 1.0f;
             for (int j = 0; j <= i; ++j) scores[j] /= sum_exp;
             for (int d = 0; d < head_dim; ++d) {
                 float val = 0.0f;
@@ -371,7 +392,7 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     
     // Reshape back and project output
     auto attn_flat = attn_output->reshape_view({seq_len, num_heads * head_dim});
-    auto out = Tensor::matmul_blocked_mt(attn_flat, o_proj);
+    auto out = Tensor::matmul_cache_friendly(attn_flat, o_proj);
     // Sanitize potential NaNs from FP8 matmul
     sanitize_tensor(out, "o_proj");
      
@@ -412,8 +433,8 @@ TensorPtr Expert::forward(const TensorPtr& x) {
     // SwiGLU: (SiLU(gate) * up) -> down
     TensorPtr inter;
     if (gate_proj) {
-        auto gate = Tensor::matmul_blocked_mt(x, gate_proj);
-        auto up = Tensor::matmul_blocked_mt(x, up_proj);
+        auto gate = Tensor::matmul_cache_friendly(x, gate_proj);
+    auto up = Tensor::matmul_cache_friendly(x, up_proj);
         // sanitize
         size_t n_g = gate->nelements();
         for (size_t i = 0; i < n_g; ++i) {
@@ -439,7 +460,7 @@ TensorPtr Expert::forward(const TensorPtr& x) {
             inter->set_from_float_flat(i, act->get_as_float_flat(i) * up->get_as_float_flat(i));
         }
     } else {
-        auto up = Tensor::matmul_blocked_mt(x, up_proj);
+        auto up = Tensor::matmul_cache_friendly(x, up_proj);
         size_t n_u = up->nelements();
         // sanitize and apply SiLU
         for (size_t i = 0; i < n_u; ++i) {
@@ -450,7 +471,7 @@ TensorPtr Expert::forward(const TensorPtr& x) {
         }
         inter = up;
     }
-    auto down = Tensor::matmul_blocked_mt(inter, down_proj);
+    auto down = Tensor::matmul_cache_friendly(inter, down_proj);
     return down;
 }
 
@@ -458,7 +479,7 @@ TensorPtr SparseMoEBlock::forward(const TensorPtr& x) {
     auto ctx = x->ctx.lock();
     if (!ctx) throw std::runtime_error("SparseMoEBlock: ctx expired");
     // Router scores: [seq_len, num_experts_from_gate]
-    auto scores = Tensor::matmul_blocked_mt(x, gate);
+    auto scores = Tensor::matmul_cache_friendly(x, gate);
     int seq_len = x->shape[0];
     int hidden_size = x->shape[1];
     int gate_cols = scores->shape[1];

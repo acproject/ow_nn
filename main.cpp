@@ -142,20 +142,47 @@ static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const 
     auto ctx = hidden->ctx.lock();
     if (!ctx) throw std::runtime_error("matvec_rows_dot: missing context");
     auto out = ow::nn::Tensor::create(ctx, {1, V}, ow::nn::DType::FLOAT32);
+    
+    // 计算输入的数值范围，用于自适应裁剪
+    float hidden_max = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float val = hidden->get_as_float_flat(k);
+        if (std::isfinite(val)) {
+            hidden_max = std::max(hidden_max, std::fabs(val));
+        }
+    }
+    
     // Compute logits row-by-row against embedding/lm_head rows
     for (int j = 0; j < V; ++j) {
-        float acc = 0.0f;
+        double acc = 0.0;  // 使用双精度累加减少误差
         size_t baseE = (size_t)j * (size_t)K;
         for (int k = 0; k < K; ++k) {
             float a = hidden->get_as_float_flat(k);
             float b = E->get_as_float_flat(baseE + k);
-            acc += a * b;
+            
+            // 检查输入数值的有效性
+            if (!std::isfinite(a)) a = 0.0f;
+            if (!std::isfinite(b)) b = 0.0f;
+            
+            // 防止单个乘法结果过大
+            double prod = static_cast<double>(a) * static_cast<double>(b);
+            if (!std::isfinite(prod)) prod = 0.0;
+            if (prod > 1e6) prod = 1e6;
+            if (prod < -1e6) prod = -1e6;
+            
+            acc += prod;
         }
-        // 简单数值裁剪防止爆炸
-        if (!std::isfinite(acc)) acc = 0.0f;
-        if (acc > 100.0f) acc = 100.0f;
-        if (acc < -100.0f) acc = -100.0f;
-        out->set_from_float_flat(j, acc);
+        
+        // 转换回单精度并进行最终裁剪
+        float result = static_cast<float>(acc);
+        if (!std::isfinite(result)) result = 0.0f;
+        
+        // 更合理的数值范围，基于模型规模调整
+        float max_logit = 50.0f;  // 增加到50，但仍然防止softmax溢出
+        if (result > max_logit) result = max_logit;
+        if (result < -max_logit) result = -max_logit;
+        
+        out->set_from_float_flat(j, result);
     }
     return out;
 }
@@ -199,13 +226,31 @@ static int argmax_logits(const ow::nn::TensorPtr &logits) {
     int V = logits->shape[1];
     float maxv = -std::numeric_limits<float>::infinity();
     int maxi = 0;
+    int valid_count = 0;
+    
     for (int i = 0; i < V; ++i) {
         float v = logits->get_as_float_flat(i);
+        
+        // 跳过非有限值
         if (!std::isfinite(v)) continue;
-        if (v > 100.0f) v = 100.0f;
-        if (v < -100.0f) v = -100.0f;
-        if (v > maxv) { maxv = v; maxi = i; }
+        
+        // 与matvec_rows_dot保持一致的裁剪范围
+        if (v > 50.0f) v = 50.0f;
+        if (v < -50.0f) v = -50.0f;
+        
+        valid_count++;
+        if (v > maxv) { 
+            maxv = v; 
+            maxi = i; 
+        }
     }
+    
+    // 如果没有有效的logits值，返回0作为默认值
+    if (valid_count == 0) {
+        std::cerr << "[WARNING] No valid logits found, using token 0" << std::endl;
+        return 0;
+    }
+    
     return maxi;
 }
 

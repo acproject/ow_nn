@@ -254,15 +254,20 @@ public:
       if (mant == 0) return sign ? -0.0f : 0.0f;
       float m = mant / 8.0f;
       float val = std::ldexp(m, 1 - bias);
+      // Clamp subnormal values to prevent accumulation issues
+      if (val > 1e-6f) val = 1e-6f;
+      else if (val < -1e-6f) val = -1e-6f;
       return sign ? -val : val;
     } else if (exp == 0x0F) {
       // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
-      // Treat both Inf and NaN as 0.0f to keep weights numerically stable
       return 0.0f;
     } else {
       float m = 1.0f + mant / 8.0f;
       int E = (int)exp - bias;
       float val = std::ldexp(m, E);
+      // Strict clamping to prevent numerical explosion
+      if (!std::isfinite(val) || val > 10.0f) val = 10.0f;
+      else if (val < -10.0f) val = -10.0f;
       return sign ? -val : val;
     }
   }
@@ -275,6 +280,9 @@ public:
       if (mant == 0) return sign ? -0.0f : 0.0f;
       float m = mant / 4.0f;
       float val = std::ldexp(m, 1 - bias);
+      // Clamp subnormal values to prevent accumulation issues
+      if (val > 1e-6f) val = 1e-6f;
+      else if (val < -1e-6f) val = -1e-6f;
       return sign ? -val : val;
     } else if (exp == 0x1F) {
       // Map FP8 specials (Inf/NaN) to finite safe values to avoid propagation
@@ -283,6 +291,10 @@ public:
       float m = 1.0f + mant / 4.0f;
       int E = (int)exp - bias;
       float val = std::ldexp(m, E);
+      // CRITICAL: FP8_E5M2 can produce very large values (up to ~57344)
+      // Strict clamping to prevent numerical explosion in matrix multiplication
+      if (!std::isfinite(val) || val > 10.0f) val = 10.0f;
+      else if (val < -10.0f) val = -10.0f;
       return sign ? -val : val;
     }
   }
@@ -483,8 +495,32 @@ public:
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
-  // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous vectors of
-  // width W
+  // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous buffer
+  // Uses scratch buffer for better memory efficiency
+  static inline float* ow_pack_B_panel_scratch(const TensorPtr &B, int j0, int j1, int p0,
+                                               int p1, int W, const std::shared_ptr<Context>& ctx) {
+    int k_len = p1 - p0;
+    float* pack = static_cast<float*>(ctx->scratch_alloc_matrix_pack(k_len, W));
+    int n = B->shape[1];
+    for (int p = 0; p < k_len; ++p) {
+      int src_p = p0 + p;
+      for (int l = 0; l < W; ++l) {
+        int j = j0 + l;
+        float bv = 0.0f;
+        if (j < j1) {
+          size_t bi = (size_t)src_p * n + j;
+          bv = B->get_as_float_flat(bi);
+          if (!std::isfinite(bv)) bv = 0.0f;
+          else if (bv > 1e6f) bv = 1e6f;
+          else if (bv < -1e6f) bv = -1e6f;
+        }
+        pack[p * W + l] = bv;
+      }
+    }
+    return pack;
+  }
+
+  // Legacy vector-based pack helper (kept for compatibility)
   static inline void ow_pack_B_panel(const TensorPtr &B, int j0, int j1, int p0,
                                      int p1, int W, std::vector<float> &pack) {
     int k_len = p1 - p0;
@@ -507,7 +543,31 @@ public:
     }
   }
 
-  // Transposed pack helper: treat B with shape [n, k] as B^T when packing
+  // Transposed pack helper with scratch buffer: treat B with shape [n, k] as B^T when packing
+  static inline float* ow_pack_B_panel_transposed_scratch(const TensorPtr &B, int j0, int j1, int p0,
+                                                          int p1, int W, const std::shared_ptr<Context>& ctx) {
+    int k_len = p1 - p0;
+    float* pack = static_cast<float*>(ctx->scratch_alloc_matrix_pack(k_len, W));
+    int k = B->shape[1];
+    for (int p = 0; p < k_len; ++p) {
+      int src_p = p0 + p; // along original k dimension
+      for (int l = 0; l < W; ++l) {
+        int j = j0 + l;   // along original n dimension
+        float bv = 0.0f;
+        if (j < j1) {
+          size_t bi = (size_t)j * k + src_p; // index [j, src_p]
+          bv = B->get_as_float_flat(bi);
+          if (!std::isfinite(bv)) bv = 0.0f;
+          else if (bv > 1e6f) bv = 1e6f;
+          else if (bv < -1e6f) bv = -1e6f;
+        }
+        pack[p * W + l] = bv;
+      }
+    }
+    return pack;
+  }
+
+  // Legacy transposed pack helper: treat B with shape [n, k] as B^T when packing
   static inline void ow_pack_B_panel_transposed(const TensorPtr &B, int j0, int j1, int p0,
                                      int p1, int W, std::vector<float> &pack) {
     int k_len = p1 - p0;
@@ -531,42 +591,204 @@ public:
   }
 
 #if defined(__AVX__)
-  // 8-wide AVX micro-kernel for one row
+  // 8-wide AVX micro-kernel for one row with numerical stability
   static inline void ow_microkernel_row_8_avx(const float *Arow_p0,
                                               const float *packB, int k_len,
                                               float *Rptr) {
     __m256 acc = _mm256_setzero_ps();
+    __m256 clamp_max = _mm256_set1_ps(1e6f);
+    __m256 clamp_min = _mm256_set1_ps(-1e6f);
+    
     for (int p = 0; p < k_len; ++p) {
       __m256 b = _mm256_loadu_ps(packB + p * 8);
       __m256 a = _mm256_set1_ps(Arow_p0[p]);
+      
+      // Clamp inputs to prevent overflow
+      a = _mm256_max_ps(_mm256_min_ps(a, clamp_max), clamp_min);
+      b = _mm256_max_ps(_mm256_min_ps(b, clamp_max), clamp_min);
+      
 #if defined(__FMA__)
       acc = _mm256_fmadd_ps(a, b, acc);
 #else
       acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
 #endif
+      
+      // Clamp accumulator to prevent overflow
+      acc = _mm256_max_ps(_mm256_min_ps(acc, clamp_max), clamp_min);
     }
+    
     __m256 prev = _mm256_loadu_ps(Rptr);
     prev = _mm256_add_ps(prev, acc);
+    // Final clamp before storing
+    prev = _mm256_max_ps(_mm256_min_ps(prev, clamp_max), clamp_min);
     _mm256_storeu_ps(Rptr, prev);
   }
 #endif
 
-  // 4-wide SSE micro-kernel for one row
+  // 4-wide SSE micro-kernel for one row with numerical stability
 #if defined(__SSE__)
   static inline void ow_microkernel_row_4_sse(const float *Arow_p0,
                                               const float *packB, int k_len,
                                               float *Rptr, int stride) {
     __m128 acc = _mm_setzero_ps();
+    __m128 clamp_max = _mm_set1_ps(1e6f);
+    __m128 clamp_min = _mm_set1_ps(-1e6f);
+    
     for (int p = 0; p < k_len; ++p) {
       __m128 b = _mm_loadu_ps(packB + p * stride);
       __m128 a = _mm_set1_ps(Arow_p0[p]);
+      
+      // Clamp inputs to prevent overflow
+      a = _mm_max_ps(_mm_min_ps(a, clamp_max), clamp_min);
+      b = _mm_max_ps(_mm_min_ps(b, clamp_max), clamp_min);
+      
       acc = _mm_add_ps(acc, _mm_mul_ps(a, b));
+      
+      // Clamp accumulator to prevent overflow
+      acc = _mm_max_ps(_mm_min_ps(acc, clamp_max), clamp_min);
     }
+    
     __m128 prev = _mm_loadu_ps(Rptr);
     prev = _mm_add_ps(prev, acc);
+    // Final clamp before storing
+    prev = _mm_max_ps(_mm_min_ps(prev, clamp_max), clamp_min);
     _mm_storeu_ps(Rptr, prev);
   }
 #endif
+
+  // Cache-friendly matrix multiplication with optimized blocking strategy
+  static TensorPtr matmul_cache_friendly(const TensorPtr &A, const TensorPtr &B,
+                                         size_t nthreads = 0) {
+    if (A->shape.size() != 2 || B->shape.size() != 2)
+      throw std::runtime_error("matmul: need 2D");
+    int m = A->shape[0];
+    int k = A->shape[1];
+
+    bool B_is_k_by_n = (B->shape[0] == k);
+    bool B_is_n_by_k = (B->shape[1] == k);
+    if (!B_is_k_by_n && !B_is_n_by_k)
+      throw std::runtime_error("matmul dim");
+    int n = B_is_k_by_n ? B->shape[1] : B->shape[0];
+
+    auto ctx = A->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+    auto R = Tensor::create(ctx, {m, n}, DType::FLOAT32);
+
+    // Adaptive block sizes based on cache hierarchy and matrix dimensions
+    // L1: 32KB, L2: 256KB, L3: 8MB (typical values)
+    size_t L1_size = 32 * 1024;
+    size_t L2_size = 256 * 1024;
+    
+    // Calculate optimal block sizes for cache efficiency
+    // For small matrices, use smaller blocks; for large matrices, use larger blocks
+    size_t block_k, block_m, block_n;
+    
+    if (k <= 64 && m <= 64 && n <= 64) {
+        // Very small matrices - use minimal blocking
+        block_k = std::min(k, 32);
+        block_m = std::min(m, 32);
+        block_n = std::min(n, 32);
+    } else if (k <= 512 && m <= 512 && n <= 512) {
+        // Medium matrices - moderate blocking
+        block_k = std::min(k, 64);
+        block_m = std::min(m, 64);
+        block_n = std::min(n, 64);
+    } else {
+        // Large matrices - aggressive blocking for cache efficiency
+        block_k = std::min(k, 128);
+        block_m = std::min(m, 128);
+        block_n = std::min(n, 128);
+    }
+    
+    // Ensure minimum block sizes for SIMD efficiency
+    block_m = std::max(block_m, (size_t)8);
+    block_n = std::max(block_n, (size_t)8);
+    block_k = std::max(block_k, (size_t)8);
+    
+    std::cout << "[MatMul] Cache-friendly blocks: M=" << block_m 
+              << ", N=" << block_n << ", K=" << block_k << std::endl;
+
+    if (nthreads == 0)
+      nthreads = std::max<size_t>(1, std::thread::hardware_concurrency());
+    ThreadPool tp(nthreads);
+
+#if defined(__AVX__)
+    const int W = 8;
+#else
+    const int W = 4;
+#endif
+
+    const bool fastA = (A->dtype == DType::FLOAT32);
+    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
+    float *Rdata = reinterpret_cast<float *>(R->data);
+
+    std::vector<std::future<void>> futs;
+    for (int i0 = 0; i0 < m; i0 += (int)block_m) {
+      int i1 = (std::min)(m, i0 + (int)block_m);
+      futs.emplace_back(tp.submit([=, &A, &B, &R]() {
+        // Reset scratch buffer at the start of each thread task
+        auto ctx = A->ctx.lock();
+        if (ctx) ctx->scratch_reset();
+        
+        for (int j0 = 0; j0 < n; j0 += (int)block_n) {
+          int j1 = (std::min)(n, j0 + (int)block_n);
+          for (int p0 = 0; p0 < k; p0 += (int)block_k) {
+            int p1 = (std::min)(k, p0 + (int)block_k);
+            for (int jpanel = j0; jpanel < j1; jpanel += W) {
+              int jend = (std::min)(j1, jpanel + W);
+              // Use scratch buffer for better memory efficiency
+              float* pack;
+              if (B_is_k_by_n) {
+                pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
+              } else {
+                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
+              }
+              int k_len = p1 - p0;
+              for (int ii = i0; ii < i1; ++ii) {
+                const float *Arow = fastA ? (Adata + ii * k + p0) : nullptr;
+                float *Rptr = Rdata + (size_t)ii * n + jpanel;
+#if defined(__AVX__)
+                if (jend - jpanel == 8 && Arow) {
+                  ow_microkernel_row_8_avx(Arow, pack, k_len, Rptr);
+                  continue;
+                }
+#endif
+#if defined(__SSE__)
+                if (jend - jpanel == 4 && Arow) {
+                  ow_microkernel_row_4_sse(Arow, pack, k_len, Rptr, W);
+                  continue;
+                }
+#endif
+                // fallback scalar for leftover columns or non-FLOAT32 A
+                int width = jend - jpanel;
+                float* acc = static_cast<float*>(ctx->scratch_alloc(width * sizeof(float)));
+                std::fill(acc, acc + width, 0.0f);
+                
+                for (int p = 0; p < k_len; ++p) {
+                  float a = fastA ? Arow[p]
+                                  : A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  if (!std::isfinite(a)) a = 0.0f;
+                  const float *bvec = pack + p * W;
+                  for (int l = 0; l < width; ++l) {
+                    acc[l] += a * bvec[l];
+                  }
+                }
+                for (int l = 0; l < width; ++l) {
+                  size_t ri = (size_t)ii * n + (jpanel + l);
+                  float prev = R->get_as_float_flat(ri);
+                  R->set_from_float_flat(ri, prev + acc[l]);
+                }
+              }
+            }
+          }
+        }
+      }));
+    }
+    for (auto &f : futs)
+      f.get();
+    return R;
+  }
 
   static TensorPtr matmul_blocked_mt(const TensorPtr &A, const TensorPtr &B,
                                      size_t block_m = 64, size_t block_n = 64,
@@ -606,17 +828,21 @@ public:
     for (int i0 = 0; i0 < m; i0 += (int)block_m) {
       int i1 = (std::min)(m, i0 + (int)block_m);
       futs.emplace_back(tp.submit([=, &A, &B, &R]() {
+        // Reset scratch buffer at the start of each thread task
+        auto ctx = A->ctx.lock();
+        if (ctx) ctx->scratch_reset();
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
           int j1 = (std::min)(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
             int p1 = (std::min)(k, p0 + (int)block_k);
             for (int jpanel = j0; jpanel < j1; jpanel += W) {
               int jend = (std::min)(j1, jpanel + W);
-              std::vector<float> pack;
+              // Use scratch buffer instead of vector allocation
+              float* pack;
               if (B_is_k_by_n) {
-                ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+                pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
               } else {
-                ow_pack_B_panel_transposed(B, jpanel, jend, p0, p1, W, pack);
+                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
               }
               int k_len = p1 - p0;
               for (int ii = i0; ii < i1; ++ii) {
@@ -624,24 +850,27 @@ public:
                 float *Rptr = Rdata + (size_t)ii * n + jpanel;
 #if defined(__AVX__)
                 if (jend - jpanel == 8 && Arow) {
-                  ow_microkernel_row_8_avx(Arow, pack.data(), k_len, Rptr);
+                  ow_microkernel_row_8_avx(Arow, pack, k_len, Rptr);
                   continue;
                 }
 #endif
 #if defined(__SSE__)
                 if (jend - jpanel == 4 && Arow) {
-                  ow_microkernel_row_4_sse(Arow, pack.data(), k_len, Rptr, W);
+                  ow_microkernel_row_4_sse(Arow, pack, k_len, Rptr, W);
                   continue;
                 }
 #endif
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
-                std::vector<float> acc(width, 0.0f);
+                // Use scratch buffer for accumulator too
+                float* acc = static_cast<float*>(ctx->scratch_alloc(width * sizeof(float)));
+                std::fill(acc, acc + width, 0.0f);
+                
                 for (int p = 0; p < k_len; ++p) {
                   float a = fastA ? Arow[p]
                                   : A->get_as_float_flat((size_t)ii * k + p0 + p);
                   if (!std::isfinite(a)) a = 0.0f;
-                  const float *bvec = pack.data() + p * W;
+                  const float *bvec = pack + p * W;
                   for (int l = 0; l < width; ++l) {
                     acc[l] += a * bvec[l];
                   }
@@ -704,28 +933,33 @@ public:
     for (int j0 = 0; j0 < n; j0 += (int)block_n) {
       int j1 = (std::min)(n, j0 + (int)block_n);
       futs.emplace_back(tp.submit([=, &A, &B]() {
+        // Reset scratch buffer at the start of each thread task
+        auto ctx = A->ctx.lock();
+        if (ctx) ctx->scratch_reset();
+        
         for (int p0 = 0; p0 < k; p0 += (int)block_k) {
           int p1 = (std::min)(k, p0 + (int)block_k);
           const float *Arow_p0 = fastA ? (Adata + p0) : nullptr;
           int k_len = p1 - p0;
           for (int jpanel = j0; jpanel < j1; jpanel += W) {
             int jend = (std::min)(j1, jpanel + W);
-            std::vector<float> pack;
+            // Use scratch buffer instead of vector allocation
+            float* pack;
             if (B_is_k_by_n) {
-              ow_pack_B_panel(B, jpanel, jend, p0, p1, W, pack);
+              pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
             } else {
-              ow_pack_B_panel_transposed(B, jpanel, jend, p0, p1, W, pack);
+              pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
             }
             float *Rptr = Rdata + jpanel;
 #if defined(__AVX__)
             if (jend - jpanel == 8 && Arow_p0) {
-              ow_microkernel_row_8_avx(Arow_p0, pack.data(), k_len, Rptr);
+              ow_microkernel_row_8_avx(Arow_p0, pack, k_len, Rptr);
               continue;
             }
 #endif
 #if defined(__SSE__)
             if (jend - jpanel == 4 && Arow_p0) {
-              ow_microkernel_row_4_sse(Arow_p0, pack.data(), k_len, Rptr, W);
+              ow_microkernel_row_4_sse(Arow_p0, pack, k_len, Rptr, W);
               continue;
             }
 #endif
@@ -735,7 +969,7 @@ public:
               float a = fastA ? Arow_p0[p]
                               : A->get_as_float_flat((size_t)p0 + p);
               if (!std::isfinite(a)) a = 0.0f;
-              const float *bvec = pack.data() + p * W;
+              const float *bvec = pack + p * W;
               for (int l = 0; l < width; ++l) {
                 Rptr[l] += a * bvec[l];
               }
