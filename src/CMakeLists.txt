@@ -11,6 +11,7 @@ set(SOURCES
     lazy_safetensors_loader.hpp
     memory_optimizer.hpp
     ops.hpp
+    logging.hpp
 )
 
 # 创建静态库

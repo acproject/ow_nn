@@ -20,6 +20,7 @@
 #include "src/context.hpp"
 #include "src/tensor.hpp"
 #include "src/memory_optimizer.hpp"
+#include "src/logging.hpp"
 #include "include/tokenizer.h"
 #include "include/sampler.h"
 #include <unordered_map>
@@ -252,7 +253,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  std::cout << "Assets: " << vocab_path << " | " << merges_path << std::endl;
+  ow::nn::log(ow::nn::LogLevel::INFO, "SYS", std::string("Assets: ") + vocab_path + " | " + merges_path);
 
   try {
     ow::nn::Tokenizer tokenizer(vocab_path, merges_path);
@@ -264,7 +265,7 @@ int main(int argc, char **argv) {
     }
     std::cout << " => decode: " << tokenizer.decode(ids) << std::endl;
   } catch (const std::exception &ex) {
-    std::cerr << "Tokenizer init failed: " << ex.what() << std::endl;
+    ow::nn::log(ow::nn::LogLevel::ERROR, "SYS", std::string("Tokenizer init failed: ") + ex.what());
     return 1;
   }
 
@@ -290,11 +291,63 @@ int main(int argc, char **argv) {
         else others.push_back(nm);
       }
 
-      std::cout << "Summary: Embedding=" << embeds.size()
-                << ", Linear=" << linears.size()
-                << ", LayerNorm=" << layernorms.size()
-                << ", Experts=" << experts.size()
-                << ", Other=" << others.size() << std::endl;
+      {
+        std::ostringstream ss;
+        ss << "Summary: Embedding=" << embeds.size()
+           << ", Linear=" << linears.size()
+           << ", LayerNorm=" << layernorms.size()
+           << ", Experts=" << experts.size()
+           << ", Other=" << others.size();
+        ow::nn::log(ow::nn::LogLevel::INFO, "SYS", ss.str());
+      }
+      
+      // Optional Python-like model struct summary
+      if (const char* vv = std::getenv("OWNN_VERBOSE_MODEL"); vv && vv[0] != '0') {
+        ow::nn::log(ow::nn::LogLevel::INFO, "SYS", "------------ model struct -----------");
+        // Accumulate parameter counts by major groups
+        std::unordered_map<std::string, size_t> group_params;
+        auto names_all = loader.names();
+        for (const auto &nm : names_all) {
+          const auto *e = loader.get_entry(nm);
+          if (!e) continue;
+          size_t params = 1;
+          for (auto d : e->shape) params *= (size_t)d;
+          auto add = [&](const std::string &g){ group_params[g] += params; };
+          if (nm.rfind("lm_head.", 0) == 0 || nm == "lm_head.weight") add("lm_head");
+          if (nm.rfind("model.", 0) == 0) add("model");
+          if (nm.rfind("model.language_model", 0) == 0) add("model.language_model");
+          if (nm.find("model.language_model.embed_tokens") != std::string::npos) add("model.language_model.embed_tokens");
+          // Per-layer
+          size_t pos = nm.find("model.language_model.layers.");
+          if (pos != std::string::npos) {
+            size_t p2 = pos + std::string("model.language_model.layers.").size();
+            std::string idx;
+            while (p2 < nm.size() && std::isdigit((unsigned char)nm[p2])) idx.push_back(nm[p2++]);
+            if (!idx.empty()) {
+              add(std::string("model.language_model.layers.") + idx);
+              if (nm.find(".self_attn.", p2) != std::string::npos) add(std::string("layers.") + idx + ".self_attn");
+              if (nm.find(".mlp.", p2) != std::string::npos) add(std::string("layers.") + idx + ".mlp");
+            }
+          }
+        }
+        auto print_group = [&](const std::string &g){
+          auto it = group_params.find(g);
+          if (it != group_params.end()) {
+            ow::nn::log(ow::nn::LogLevel::INFO, "SYS", g + std::string(" ") + ow::nn::format_params_count(it->second));
+          }
+        };
+        print_group("lm_head");
+        print_group("model");
+        print_group("model.language_model");
+        print_group("model.language_model.embed_tokens");
+        // Print a few layer summaries
+        for (int li = 0; li < 4; ++li) {
+          std::string L = std::string("model.language_model.layers.") + std::to_string(li);
+          print_group(L);
+          print_group(std::string("layers.") + std::to_string(li) + ".self_attn");
+          print_group(std::string("layers.") + std::to_string(li) + ".mlp");
+        }
+      }
 
       auto print_entry = [&](const std::string &key) {
         const auto *e = loader.get_entry(key);
@@ -343,10 +396,10 @@ int main(int argc, char **argv) {
         std::cout << std::endl;
       }
     } else {
-      std::cout << "No weights directory provided; skipping weights summary." << std::endl;
+      ow::nn::log(ow::nn::LogLevel::WARN, "SYS", "No weights directory provided; skipping weights summary.");
     }
   } catch (const std::exception &ex) {
-    std::cerr << "Weights load failed: " << ex.what() << std::endl;
+    ow::nn::log(ow::nn::LogLevel::ERROR, "SYS", std::string("Weights load failed: ") + ex.what());
   }
 
   // MHA smoke test block to validate reshape/matmul order
@@ -379,24 +432,30 @@ int main(int argc, char **argv) {
     auto mha = std::make_shared<MultiHeadAttention>(q_proj, k_proj, v_proj, o_proj, qnw, knw, num_heads, num_kv_heads, hidden_size);
 
     auto hidden = mk({seq_len, hidden_size});
-    std::cout << "[Sanity] hidden dtype=" << (int)hidden->dtype << " row0: ";
-    for (int h=0; h<hidden_size; ++h) {
-      std::cout << hidden->get_as_float_flat((size_t)h) << (h+1<hidden_size?",":"");
+    if (ow::nn::ow_verbose_mha()) {
+      std::ostringstream ss;
+      ss << "hidden dtype=" << (int)hidden->dtype << " row0: ";
+      for (int h=0; h<hidden_size; ++h) {
+        ss << hidden->get_as_float_flat((size_t)h) << (h+1<hidden_size?",":"");
+      }
+      ow::nn::log(ow::nn::LogLevel::DEBUG, "MHA", ss.str());
     }
-    std::cout << std::endl;
     auto out = mha->forward(hidden, seq_len);
-    std::cout << "[MHA Smoke] out shape=(" << out->shape[0] << "," << out->shape[1] << ")" << std::endl;
-    std::cout << "[MHA Smoke] first row: ";
-    for (int j=0;j<out->shape[1]; ++j) {
-      std::cout << out->get_as_float_flat((size_t)j) << (j+1<out->shape[1] ? "," : "");
+    if (ow::nn::ow_verbose_mha()) {
+      ow::nn::log(ow::nn::LogLevel::DEBUG, "MHA", std::string("out shape=(") + std::to_string(out->shape[0]) + "," + std::to_string(out->shape[1]) + ")");
+      std::ostringstream ss2;
+      ss2 << "first row: ";
+      for (int j=0;j<out->shape[1]; ++j) {
+        ss2 << out->get_as_float_flat((size_t)j) << (j+1<out->shape[1] ? "," : "");
+      }
+      ow::nn::log(ow::nn::LogLevel::DEBUG, "MHA", ss2.str());
     }
-    std::cout << std::endl;
   }
 
   // === Build model and run a short text generation with real weights ===
   try {
     std::string model_dir = weights_dir.empty() ? std::string(DEFAULT_WEIGHTS_DIR) : weights_dir;
-    std::cout << "[GEN] Using model dir: " << model_dir << "\n";
+    ow::nn::log(ow::nn::LogLevel::INFO, "GEN", std::string("Using model dir: ") + model_dir);
 
     ow::nn::LazySafetensorsLoader gen_loader;
     gen_loader.load_dir(model_dir);
@@ -404,8 +463,11 @@ int main(int argc, char **argv) {
     size_t optimal_size = ow::nn::MemoryOptimizer::get_optimal_initial_context_size();
     auto gen_ctx = std::make_shared<ow::nn::Context>(optimal_size);
     
-    std::cout << "[GEN] Using optimized context size: " 
-              << (optimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
+    {
+      std::ostringstream ss; ss.setf(std::ios::fixed); ss.precision(2);
+      ss << "Using optimized context size: " << (optimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB";
+      ow::nn::log(ow::nn::LogLevel::INFO, "GEN", ss.str());
+    }
     
     std::vector<std::string> weight_patterns = {
         "model.language_model",
@@ -440,7 +502,7 @@ int main(int argc, char **argv) {
     }
     ow::nn::Tokenizer tok(vocab_path_final, merges_path_final);
 
-    std::cout << "[Chat] Type your question. Use /exit to quit.\n";
+    ow::nn::log(ow::nn::LogLevel::INFO, "Chat", "Type your question. Use /exit to quit.");
     std::vector<std::pair<std::string, std::string>> history;
     while (true) {
       std::string question;
@@ -483,7 +545,7 @@ int main(int argc, char **argv) {
           }
         }
         if (has_nan) {
-          std::cerr << "[ERROR] NaN detected in hidden states at step " << step << ", stopping generation" << std::endl;
+          ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", std::string("NaN detected in hidden states at step ") + std::to_string(step) + ", stopping generation");
           break;
         }
         
@@ -507,15 +569,18 @@ int main(int argc, char **argv) {
           }
         }
         if (has_nan) {
-          std::cerr << "[ERROR] NaN detected in logits at step " << step << ", stopping generation" << std::endl;
+          ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", std::string("NaN detected in logits at step ") + std::to_string(step) + ", stopping generation");
           break;
         }
         
-        if (verbose && (step % verbose_every == 0)) {
-          auto top5 = topk_indices_from_logits(logits, 5);
-          std::cout << "[DBG top-5] ";
-          for (const auto &p : top5) { std::cout << "(" << p.first << ":" << p.second << ") "; }
-          std::cout << "\n";
+        if (verbose || ow::nn::ow_verbose_gen()) {
+          if (step % verbose_every == 0) {
+            auto top5 = topk_indices_from_logits(logits, 5);
+            std::ostringstream oss;
+            oss << "step=" << step << " top-5: ";
+            for (const auto &p : top5) { oss << "(" << p.first << ":" << p.second << ") "; }
+            ow::nn::log(ow::nn::LogLevel::DEBUG, "GEN", oss.str());
+          }
         }
 
         if (greedy) {
@@ -538,12 +603,15 @@ int main(int argc, char **argv) {
         std::string piece_raw = tok.decode_id(nextTokenId);
         std::string piece = normalize_token_str(piece_raw);
 
-        if (verbose && (step % verbose_every == 0)) {
-          std::cout << "[tok] id=" << nextTokenId << " raw=\"" << piece_raw << "\"" << std::endl;
+        if (verbose || ow::nn::ow_verbose_gen()) {
+          if (step % verbose_every == 0) {
+            ow::nn::log(ow::nn::LogLevel::DEBUG, "GEN", std::string("tok id=") + std::to_string(nextTokenId) + " raw=\"" + piece_raw + "\"");
+          }
         }
 
         if (piece == "</s>" || piece == " ") {
-          std::cout << "\n[GEN] EOS reached." << std::endl;
+          ow::nn::log(ow::nn::LogLevel::INFO, "GEN", std::string("EOS reached."));
+          std::cout << "\n";
           break;
         }
 
@@ -554,7 +622,7 @@ int main(int argc, char **argv) {
         if (!placeholder && (piece.empty() || piece == " " || piece == "\t")) {
           consecutive_empty_tokens++;
           if (consecutive_empty_tokens > 20) {
-            std::cerr << "[WARNING] Too many consecutive empty tokens, stopping generation" << std::endl;
+            ow::nn::log(ow::nn::LogLevel::WARN, "GEN", std::string("Too many consecutive empty tokens, stopping generation"));
             break;
           }
         } else {
@@ -567,7 +635,7 @@ int main(int argc, char **argv) {
       history.emplace_back(question, answer);
     }
   } catch (const std::exception &e) {
-    std::cerr << "[GEN][Error] " << e.what() << "\n";
+    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", std::string("Error: ") + e.what());
   }
 
   return 0;
