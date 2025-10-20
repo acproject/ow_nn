@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdlib>
 
 // 前缀声明，用于定义下面的智能指针
 namespace ow::nn {
@@ -695,8 +696,10 @@ public:
     block_n = std::max(block_n, (size_t)8);
     block_k = std::max(block_k, (size_t)8);
     
-    std::cout << "[MatMul] Cache-friendly blocks: M=" << block_m 
-              << ", N=" << block_n << ", K=" << block_k << std::endl;
+    if (const char* vv = std::getenv("OWNN_VERBOSE_MATMUL"); vv && vv[0] != '0') {
+      std::cout << "[MatMul] Cache-friendly blocks: M=" << block_m 
+                << ", N=" << block_n << ", K=" << block_k << std::endl;
+    }
 
     if (nthreads == 0)
       nthreads = std::max<size_t>(1, std::thread::hardware_concurrency());
@@ -769,6 +772,8 @@ public:
                   R->set_from_float_flat(ri, prev + acc_buf[l]);
                 }
               }
+              // Release scratch used by this panel to avoid accumulation
+              if (ctx) ctx->scratch_reset();
             }
           }
         }
@@ -869,6 +874,8 @@ public:
                   R->set_from_float_flat(ri, prev + acc_buf[l]);
                 }
               }
+              // Release scratch used by this panel to avoid accumulation
+              if (ctx) ctx->scratch_reset();
             }
           }
         }
@@ -942,26 +949,31 @@ public:
 #if defined(__AVX__)
             if (jend - jpanel == 8 && Arow_p0) {
               ow_microkernel_row_8_avx(Arow_p0, pack, k_len, Rptr);
+              // Release scratch per panel
+              if (ctx) ctx->scratch_reset();
               continue;
             }
 #endif
 #if defined(__SSE__)
             if (jend - jpanel == 4 && Arow_p0) {
               ow_microkernel_row_4_sse(Arow_p0, pack, k_len, Rptr, W);
+              // Release scratch per panel
+              if (ctx) ctx->scratch_reset();
               continue;
             }
 #endif
             // fallback: 标量累加
             int width = jend - jpanel;
             for (int p = 0; p < k_len; ++p) {
-              float a = fastA ? Arow_p0[p]
-                              : A->get_as_float_flat((size_t)p0 + p);
+              float a = fastA ? Arow_p0[p] : A->get_as_float_flat(p0 + p);
               if (!std::isfinite(a)) a = 0.0f;
               const float *bvec = pack + p * W;
               for (int l = 0; l < width; ++l) {
                 Rptr[l] += a * bvec[l];
               }
             }
+            // Release scratch per panel
+            if (ctx) ctx->scratch_reset();
           }
         }
       }));

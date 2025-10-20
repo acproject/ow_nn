@@ -18,6 +18,10 @@
 
 namespace ow::nn {
 
+// Verbosity gates forward declarations
+static bool ow_verbose_rope();
+static bool ow_verbose_moe();
+
 // Ensure a 2D linear weight has expected dims, but avoid copying.
 // If loaded as [out_dim, in_dim], leave it as-is; matmul handles transposed B.
 static TensorPtr ensure_linear_weight_or_transpose(const TensorPtr& W, int expected_in_dim, int expected_out_dim = -1) {
@@ -142,7 +146,7 @@ TensorPtr RotaryEmbedding::apply_rotary_pos_emb(const TensorPtr& x, const Tensor
                 float sin_val = sin->get_as_float_flat(cos_idx);
                 
                 // Fix debug guard variable name
-                if (i == 0 && h == 0 && d == 0) {
+                if (ow_verbose_rope() && i == 0 && h == 0 && d == 0) {
                     std::cout << "[RoPE] idx1=" << idx1 << " idx2=" << idx2 << " cos_idx=" << cos_idx 
                               << " x1=" << x1 << " x2=" << x2 << " cos=" << cos_val << " sin=" << sin_val << std::endl;
                 }
@@ -163,6 +167,15 @@ TensorPtr RotaryEmbedding::apply_rotary_pos_emb(const TensorPtr& x, const Tensor
 // Add environment-gated verbosity for MHA/KV debug
 static bool ow_verbose_mha() {
     const char* v = std::getenv("OWNN_VERBOSE_MHA");
+    return v != nullptr && v[0] != '0';
+}
+// Add separate gates for RoPE and MoE
+static bool ow_verbose_rope() {
+    const char* v = std::getenv("OWNN_VERBOSE_ROPE");
+    return v != nullptr && v[0] != '0';
+}
+static bool ow_verbose_moe() {
+    const char* v = std::getenv("OWNN_VERBOSE_MOE");
     return v != nullptr && v[0] != '0';
 }
 
@@ -453,10 +466,13 @@ TensorPtr Expert::forward(const TensorPtr& x) {
         }
         std::cout << std::endl;
     };
-    print_rank_dims("[MoE] x", x);
-    print_rank_dims("[MoE] gate_proj", gate_proj);
-    print_rank_dims("[MoE] up_proj", up_proj);
-    print_rank_dims("[MoE] down_proj", down_proj);
+
+    if (ow_verbose_moe()) {
+        print_rank_dims("[MoE] x", x);
+        print_rank_dims("[MoE] gate_proj", gate_proj);
+        print_rank_dims("[MoE] up_proj", up_proj);
+        print_rank_dims("[MoE] down_proj", down_proj);
+    }
     
     // SwiGLU: (SiLU(gate) * up) -> down
     TensorPtr inter;
@@ -803,7 +819,9 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
             int router_experts = (gate_weight->shape[0] == hidden_size)
                                    ? gate_weight->shape[1]
                                    : gate_weight->shape[0];
-            std::cout << "[MoE] Router experts from gate weight: " << router_experts << std::endl;
+            if (ow_verbose_moe()) {
+                std::cout << "[MoE] Router experts from gate weight: " << router_experts << std::endl;
+            }
             
             // Prepare expert container
             if (experts_gate_up_proj && experts_down_proj &&
@@ -817,10 +835,13 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
                 if (I <= 0 || (GU % 2) != 0) I = GU / 2;
                 intermediate_size = (intermediate_size < 0) ? I : intermediate_size;
                 int build_E = std::min(E, router_experts);
-                std::cout << "[MoE] Slicing merged experts: E=" << E
-                          << " H=" << H << " GU=" << GU
-                          << " -> inferred I=" << I << " H_down=" << H_down
-                          << " build_E=" << build_E << std::endl;
+
+                if (ow_verbose_moe()) {
+                    std::cout << "[MoE] Slicing merged experts: E=" << E
+                              << " H=" << H << " GU=" << GU
+                              << " -> inferred I=" << I << " H_down=" << H_down
+                              << " build_E=" << build_E << std::endl;
+                }
                 for (int e = 0; e < build_E; ++e) {
                     auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
                     auto gate_e = gate_e_3d->view({H, I}, {gate_e_3d->strides[1], gate_e_3d->strides[2]});
@@ -833,7 +854,10 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
                     down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
                     experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
                 }
-                std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
+
+                if (ow_verbose_moe()) {
+                    std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
+                }
             } else {
                 int I = -1;
                 if (experts_gate_up_proj && experts_gate_up_proj->shape.size() == 2) {
@@ -851,11 +875,14 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
                     auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, hidden_size);
                     experts.push_back(std::make_shared<Expert>(nullptr, up2d, down2d));
                 }
-                std::cout << "[MoE] Built merged single expert (fallback)" << std::endl;
+
+                if (ow_verbose_moe()) {
+                    std::cout << "[MoE] Built merged single expert (fallback)" << std::endl;
+                }
             }
             moe = std::make_shared<SparseMoEBlock>(gate_weight, experts, top_k);
         }
-        
+
         // Layer norms
         TensorPtr input_layernorm_weight, post_attention_layernorm_weight;
         for (const auto &lp : layer_prefixes) {
