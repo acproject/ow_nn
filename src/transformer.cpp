@@ -5,6 +5,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <set>
+#include <cstdlib>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -159,6 +160,12 @@ TensorPtr RotaryEmbedding::apply_rotary_pos_emb(const TensorPtr& x, const Tensor
 }
 
 // MultiHeadAttention implementation
+// Add environment-gated verbosity for MHA/KV debug
+static bool ow_verbose_mha() {
+    const char* v = std::getenv("OWNN_VERBOSE_MHA");
+    return v != nullptr && v[0] != '0';
+}
+
 MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr& k_proj, 
                                      const TensorPtr& v_proj, const TensorPtr& o_proj,
                                      const TensorPtr& q_norm_weight, const TensorPtr& k_norm_weight,
@@ -179,18 +186,35 @@ MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr&
     int q_out = infer_out_dim(q_proj);
     int k_out = infer_out_dim(k_proj);
     int v_out = infer_out_dim(v_proj);
-    int inferred_hd = (num_kv_heads > 0 && k_out % num_kv_heads == 0)
-                        ? (k_out / num_kv_heads)
-                        : ((num_heads > 0 && q_out % num_heads == 0)
-                            ? (q_out / num_heads)
-                            : (hidden_size / std::max(1, num_heads)));
+    int hd_q = (num_heads > 0 && q_out % num_heads == 0) ? (q_out / num_heads) : -1;
+    int hd_k = (num_kv_heads > 0 && k_out % num_kv_heads == 0) ? (k_out / num_kv_heads) : -1;
+    int hd_v = (num_kv_heads > 0 && v_out % num_kv_heads == 0) ? (v_out / num_kv_heads) : -1;
+    if (hd_q > 0 && hd_k > 0 && hd_q != hd_k && ow_verbose_mha()) {
+        std::cout << "[MHA] head_dim mismatch q=" << hd_q << " k=" << hd_k
+                  << ", prefer q-based head_dim" << std::endl;
+    }
+    int inferred_hd = (hd_q > 0) ? hd_q : (hd_k > 0 ? hd_k : (hidden_size / std::max(1, num_heads)));
     head_dim = inferred_hd;
 
-    std::cout << "[MHA] head_dim inference: hidden_size=" << hidden_size
-              << " q_out=" << q_out << " k_out=" << k_out << " v_out=" << v_out
-              << " -> head_dim=" << head_dim << " (num_heads=" << num_heads
-              << ", num_kv_heads=" << num_kv_heads << ")" << std::endl;
+    // Auto-correct num_kv_heads based on actual K/V projection sizes
+    int kv_from_k = (head_dim > 0 && k_out % head_dim == 0) ? (k_out / head_dim) : -1;
+    int kv_from_v = (head_dim > 0 && v_out % head_dim == 0) ? (v_out / head_dim) : -1;
+    int kv_target = kv_from_k > 0 ? kv_from_k : kv_from_v;
+    if (kv_target > 0 && kv_target != num_kv_heads) {
+        if (ow_verbose_mha()) {
+            std::cout << "[MHA] Adjust num_kv_heads from " << num_kv_heads
+                      << " to " << kv_target << " based on k/v dims (k_out=" << k_out
+                      << ", v_out=" << v_out << ", head_dim=" << head_dim << ")" << std::endl;
+        }
+        this->num_kv_heads = kv_target;
+    }
 
+    if (ow_verbose_mha()) {
+        std::cout << "[MHA] head_dim inference: hidden_size=" << hidden_size
+                  << " q_out=" << q_out << " k_out=" << k_out << " v_out=" << v_out
+                  << " -> head_dim=" << head_dim << " (num_heads=" << num_heads
+                  << ", num_kv_heads=" << this->num_kv_heads << ")" << std::endl;
+    }
     q_norm = std::make_shared<RMSNorm>(q_norm_weight);
     k_norm = std::make_shared<RMSNorm>(k_norm_weight);
     rotary_emb = std::make_shared<RotaryEmbedding>(head_dim);
@@ -213,33 +237,41 @@ void MultiHeadAttention::init_cache(const std::shared_ptr<Context>& ctx, int max
 TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_len) {
     auto ctx = hidden_states->ctx.lock();
     if (!ctx) throw std::runtime_error("MultiHeadAttention: ctx expired");
-    std::cout << "[MHA] Start: seq_len=" << seq_len
-              << " hidden_size=" << hidden_size
-              << " q_proj=[" << q_proj->shape[0] << "," << q_proj->shape[1] << "]"
-              << " k_proj=[" << k_proj->shape[0] << "," << k_proj->shape[1] << "]"
-              << " v_proj=[" << v_proj->shape[0] << "," << v_proj->shape[1] << "]"
-              << " v_proj.dtype=" << (int)v_proj->dtype
-              << std::endl;
+    if (ow_verbose_mha()) {
+        std::cout << "[MHA] Start: seq_len=" << seq_len
+                  << " hidden_size=" << hidden_size
+                  << " q_proj=[" << q_proj->shape[0] << "," << q_proj->shape[1] << "]"
+                  << " k_proj=[" << k_proj->shape[0] << "," << k_proj->shape[1] << "]"
+                  << " v_proj=[" << v_proj->shape[0] << "," << v_proj->shape[1] << "]"
+                  << " v_proj.dtype=" << (int)v_proj->dtype
+                  << std::endl;
+    }
 
     // Ensure KV cache is initialized and persistent
     if (!k_cache || !v_cache) {
         init_cache(ctx, std::max(seq_len, rotary_emb->max_seq_len));
-        std::cout << "[KV] Initialized cache: max_seq_len=" << max_seq_len << std::endl;
+        if (ow_verbose_mha()) {
+            std::cout << "[KV] Initialized cache: max_seq_len=" << max_seq_len << std::endl;
+        }
     }
     // Reset cache when sequence length shrinks (new prompt)
     if (seq_len < cache_len) {
-        std::cout << "[KV] Reset cache_len from " << cache_len << " to 0 (new prompt)" << std::endl;
+        if (ow_verbose_mha()) {
+            std::cout << "[KV] Reset cache_len from " << cache_len << " to 0 (new prompt)" << std::endl;
+        }
         cache_len = 0;
     }
 
     // Print a slice of hidden_states row 0
     int hs_print = std::min(hidden_size, 8);
-    std::cout << "[MHA] hidden_states[0,:" << hs_print << "]: ";
-    for (int h = 0; h < hs_print; ++h) {
-        std::cout << hidden_states->get_as_float_flat(0 * hidden_size + h) << (h+1<hs_print?",":"");
+    if (ow_verbose_mha()) {
+        std::cout << "[MHA] hidden_states[0,:" << hs_print << "]: ";
+        for (int h = 0; h < hs_print; ++h) {
+            std::cout << hidden_states->get_as_float_flat(0 * hidden_size + h) << (h+1<hs_print?",":"");
+        }
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
-    
+
     // hidden_states: [seq_len, hidden_size]
     // Project Q for all tokens (kept simple); K/V update incrementally using cache
     auto q = Tensor::matmul_cache_friendly(hidden_states, q_proj);
@@ -282,6 +314,14 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
         auto v_i = Tensor::matvec_blocked_mt(x_i, v_proj);
         sanitize_tensor(k_i, "k_proj[i]");
         sanitize_tensor(v_i, "v_proj[i]");
+        // Debug current KV dims before reshape
+        if (ow_verbose_mha()) {
+            std::cout << "[MHA DBG] num_kv_heads=" << num_kv_heads
+                      << " head_dim=" << head_dim
+                      << " k_i out_dim=" << (k_i->shape.size()>=2?k_i->shape[1]:-1)
+                      << " v_i out_dim=" << (v_i->shape.size()>=2?v_i->shape[1]:-1)
+                      << std::endl;
+        }
         // reshape to [1, num_kv_heads, head_dim]
         auto k_i_r = k_i->reshape_view({1, num_kv_heads, head_dim});
         auto v_i_r = v_i->reshape_view({1, num_kv_heads, head_dim});
@@ -316,16 +356,18 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
 
     // Debug: print first few K/V cache values at position 0
     int kv_print = std::min(head_dim, 8);
-    std::cout << "[KV] k_cache[0,0,:]: ";
-    for (int d = 0; d < kv_print; ++d) {
-        std::cout << k_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
+    if (ow_verbose_mha()) {
+        std::cout << "[KV] k_cache[0,0,:]: ";
+        for (int d = 0; d < kv_print; ++d) {
+            std::cout << k_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
+        }
+        std::cout << std::endl;
+        std::cout << "[KV] v_cache[0,0,:]: ";
+        for (int d = 0; d < kv_print; ++d) {
+            std::cout << v_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
+        }
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
-    std::cout << "[KV] v_cache[0,0,:]: ";
-    for (int d = 0; d < kv_print; ++d) {
-        std::cout << v_cache->get_as_float_flat(0 * num_kv_heads * head_dim + 0 * head_dim + d) << (d+1<kv_print?",":"");
-    }
-    std::cout << std::endl;
     
     // Compute attention scores with improved numerical stability using cached K/V
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -382,16 +424,18 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
      
     // Debug: print a slice of attn_flat and out
     int out_print = std::min(num_heads * head_dim, 8);
-    std::cout << "[MHA] attn_flat[0,:" << out_print << "]: ";
-    for (int d = 0; d < out_print; ++d) {
-        std::cout << attn_flat->get_as_float_flat(0 * (num_heads * head_dim) + d) << (d+1<out_print?",":"");
+    if (ow_verbose_mha()) {
+        std::cout << "[MHA] attn_flat[0,:" << out_print << "]: ";
+        for (int d = 0; d < out_print; ++d) {
+            std::cout << attn_flat->get_as_float_flat(0 * (num_heads * head_dim) + d) << (d+1<out_print?",":"");
+        }
+        std::cout << std::endl;
+        std::cout << "[MHA] o_proj out[0,:" << out_print << "]: ";
+        for (int d = 0; d < out_print; ++d) {
+            std::cout << out->get_as_float_flat(0 * hidden_size + d) << (d+1<out_print?",":"");
+        }
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
-    std::cout << "[MHA] o_proj out[0,:" << out_print << "]: ";
-    for (int d = 0; d < out_print; ++d) {
-        std::cout << out->get_as_float_flat(0 * hidden_size + d) << (d+1<out_print?",":"");
-    }
-    std::cout << std::endl;
 
     return out;
 }
@@ -625,15 +669,44 @@ TensorPtr Qwen3VLTextModel::forward(const std::vector<int>& input_ids) {
 std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     // Model configuration based on Qwen3VL config.json
     const int vocab_size = 151936;
-    const int num_layers = 48;     // Corrected from config.json
+    int num_layers = 48;     // default; will attempt to detect from weights
+    // duplicate removed: num_heads
+// duplicate removed: num_kv_heads
+// duplicate removed: intermediate_size
+// duplicate removed: num_experts
+// duplicate removed: top_k
+    
+    // Auto-detect layer count from available weight keys (robust across naming schemes)
+    int max_layer_index = -1;
+    for (const auto& kv : weights) {
+        const std::string& name = kv.first;
+        auto extract = [&](const std::string& prefix){
+            if (name.rfind(prefix, 0) == 0) {
+                size_t pos = prefix.size();
+                size_t end = name.find('.', pos);
+                if (end != std::string::npos) {
+                    int idx = std::atoi(name.substr(pos, end - pos).c_str());
+                    if (idx > max_layer_index) max_layer_index = idx;
+                }
+            }
+        };
+        extract("model.language_model.layers.");
+        extract("language_model.layers.");
+        extract("model.layers.");
+    }
+    if (max_layer_index >= 0) num_layers = max_layer_index + 1;
     const int num_heads = 32;
     const int num_kv_heads = 4;
     int intermediate_size = -1;  // infer from weights when available
     const int num_experts = 128;
     const int top_k = 8;
     
-    // Get embedding weights
+    // Get embedding weights (robust to different prefixes)
     auto embed_tokens = get_weight("model.embed_tokens.weight");
+    if (!embed_tokens) embed_tokens = get_weight("model.language_model.embed_tokens.weight");
+    if (!embed_tokens) embed_tokens = get_weight("language_model.embed_tokens.weight");
+    if (!embed_tokens) embed_tokens = get_weight("embed_tokens.weight");
+    if (!embed_tokens) embed_tokens = get_weight("wte.weight");
     if (!embed_tokens) {
         throw std::runtime_error("WeightLoader: embed_tokens.weight not found");
     }
@@ -649,15 +722,23 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
     std::vector<std::shared_ptr<DecoderLayer>> layers;
     
     for (int i = 0; i < num_layers; ++i) {
-        std::string layer_prefix = "model.layers." + std::to_string(i) + ".";
+        // Try multiple possible layer prefixes
+        std::vector<std::string> layer_prefixes = {
+            std::string("model.layers.") + std::to_string(i) + ".",
+            std::string("model.language_model.layers.") + std::to_string(i) + ".",
+            std::string("language_model.layers.") + std::to_string(i) + "."
+        };
         
         // Attention weights
-        auto q_proj_raw = get_weight(layer_prefix + "self_attn.q_proj.weight");
-        auto k_proj_raw = get_weight(layer_prefix + "self_attn.k_proj.weight");
-        auto v_proj_raw = get_weight(layer_prefix + "self_attn.v_proj.weight");
-        auto o_proj_raw = get_weight(layer_prefix + "self_attn.o_proj.weight");
-        auto q_norm_weight = get_weight(layer_prefix + "self_attn.q_norm.weight");
-        auto k_norm_weight = get_weight(layer_prefix + "self_attn.k_norm.weight");
+        TensorPtr q_proj_raw, k_proj_raw, v_proj_raw, o_proj_raw, q_norm_weight, k_norm_weight;
+        for (const auto &lp : layer_prefixes) {
+            if (!q_proj_raw) q_proj_raw = get_weight(lp + "self_attn.q_proj.weight");
+            if (!k_proj_raw) k_proj_raw = get_weight(lp + "self_attn.k_proj.weight");
+            if (!v_proj_raw) v_proj_raw = get_weight(lp + "self_attn.v_proj.weight");
+            if (!o_proj_raw) o_proj_raw = get_weight(lp + "self_attn.o_proj.weight");
+            if (!q_norm_weight) q_norm_weight = get_weight(lp + "self_attn.q_norm.weight");
+            if (!k_norm_weight) k_norm_weight = get_weight(lp + "self_attn.k_norm.weight");
+        }
         
         if (!q_proj_raw || !k_proj_raw || !v_proj_raw || !o_proj_raw || !q_norm_weight || !k_norm_weight) {
             std::cerr << "Warning: Missing attention weights for layer " << i << std::endl;
@@ -671,100 +752,116 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         // Avoid FP8 NaNs in output projection by converting to FLOAT32
         o_proj = o_proj->astype(DType::FLOAT32);
          
-          // Create attention layer
-          auto attention = std::make_shared<MultiHeadAttention>(
-              q_proj, k_proj, v_proj, o_proj,
-              q_norm_weight, k_norm_weight,
-              num_heads, num_kv_heads, hidden_size
-          );
+        // Create attention layer
+        auto attention = std::make_shared<MultiHeadAttention>(
+            q_proj, k_proj, v_proj, o_proj,
+            q_norm_weight, k_norm_weight,
+            num_heads, num_kv_heads, hidden_size
+        );
         
-        // MoE weights - this model uses merged expert weights
-        auto gate_weight_raw = get_weight(layer_prefix + "mlp.gate.weight");
-        auto experts_gate_up_proj = get_weight(layer_prefix + "mlp.experts.gate_up_proj");
-        auto experts_down_proj = get_weight(layer_prefix + "mlp.experts.down_proj");
-        
-        if (!gate_weight_raw || !experts_gate_up_proj || !experts_down_proj) {
-            std::cerr << "Warning: Missing MoE weights for layer " << i << std::endl;
-            continue;
+        // MoE weights - merged expert weights
+        TensorPtr gate_weight_raw, experts_gate_up_proj, experts_down_proj;
+        for (const auto &lp : layer_prefixes) {
+            if (!gate_weight_raw) gate_weight_raw = get_weight(lp + "mlp.gate.weight");
+            if (!experts_gate_up_proj) experts_gate_up_proj = get_weight(lp + "mlp.experts.gate_up_proj");
+            if (!experts_down_proj) experts_down_proj = get_weight(lp + "mlp.experts.down_proj");
         }
         
-        auto gate_weight = ensure_linear_weight_or_transpose(gate_weight_raw, hidden_size);
-        // Derive router expert count from gate weight dims (supports transposed layout)
-        int router_experts = (gate_weight->shape[0] == hidden_size)
-                               ? gate_weight->shape[1]
-                               : gate_weight->shape[0];
-        std::cout << "[MoE] Router experts from gate weight: " << router_experts << std::endl;
-        
-        // Prepare expert container
+        // Decide MoE vs Dense MLP
+        std::shared_ptr<SparseMoEBlock> moe;
         std::vector<std::shared_ptr<Expert>> experts;
-        
-        if (experts_gate_up_proj && experts_down_proj &&
-            experts_gate_up_proj->shape.size() == 3 && experts_down_proj->shape.size() == 3) {
-            int E = experts_gate_up_proj->shape[0];
-            int H = experts_gate_up_proj->shape[1];
-            int GU = experts_gate_up_proj->shape[2]; // gate+up merged
-            int I_down = experts_down_proj->shape[1];
-            int H_down = experts_down_proj->shape[2];
-            // Infer intermediate_size: prefer down_proj's in-dim; fallback to GU/2
-            int I = I_down;
-            if (I <= 0 || (GU % 2) != 0) I = GU / 2;
-            intermediate_size = (intermediate_size < 0) ? I : intermediate_size;
-            int build_E = std::min(E, router_experts);
-             std::cout << "[MoE] Slicing merged experts: E=" << E
-                       << " H=" << H << " GU=" << GU
-                       << " -> inferred I=" << I << " H_down=" << H_down
-                       << " build_E=" << build_E << std::endl;
-             for (int e = 0; e < build_E; ++e) {
-                 // Gate part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
-                 auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
-                 // Create a 2D view using inner strides to avoid large copies
-                 auto gate_e = gate_e_3d->view({H, I}, {gate_e_3d->strides[1], gate_e_3d->strides[2]});
-                 gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
-                 
-                 // Up part: [1,H,I] -> [H,I]; slice then materialize contiguous before reshape
-                 auto up_e_3d = experts_gate_up_proj->slice_view({e, 0, I}, {1, H, I});
-                 auto up_e = up_e_3d->view({H, I}, {up_e_3d->strides[1], up_e_3d->strides[2]});
-                 up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
-                 
-                 // Down part: [1,I,H] -> [I,H]; this slice is contiguous, reshape directly
-                 auto down_e_3d = experts_down_proj->slice_view({e, 0, 0}, {1, I, hidden_size});
-                 auto down_e = down_e_3d->reshape_view({I, hidden_size});
-                 down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
-               
-                 experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
+        if (!gate_weight_raw || !experts_gate_up_proj || !experts_down_proj) {
+            // Dense MLP fallback: Qwen uses SwiGLU with gate_proj/up_proj/down_proj
+            TensorPtr dense_gate_proj_raw, dense_up_proj_raw, dense_down_proj_raw;
+            for (const auto &lp : layer_prefixes) {
+                if (!dense_gate_proj_raw) dense_gate_proj_raw = get_weight(lp + "mlp.gate_proj.weight");
+                if (!dense_up_proj_raw) dense_up_proj_raw = get_weight(lp + "mlp.up_proj.weight");
+                if (!dense_down_proj_raw) dense_down_proj_raw = get_weight(lp + "mlp.down_proj.weight");
             }
-            std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
+            if (!dense_up_proj_raw || !dense_down_proj_raw) {
+                std::cerr << "Warning: Missing MLP weights for layer " << i << std::endl;
+                continue;
+            }
+            auto gate_proj = dense_gate_proj_raw ? ensure_linear_weight_or_transpose(dense_gate_proj_raw, hidden_size) : nullptr;
+            auto up_proj = ensure_linear_weight_or_transpose(dense_up_proj_raw, hidden_size);
+            int I = up_proj->shape.size() == 2 ? up_proj->shape[1] : -1;
+            if (I <= 0) {
+                std::cerr << "Warning: Invalid up_proj dims for layer " << i << std::endl;
+                continue;
+            }
+            auto down_proj = ensure_linear_weight_or_transpose(dense_down_proj_raw, I, hidden_size);
+            experts.push_back(std::make_shared<Expert>(gate_proj, up_proj, down_proj));
+            // Stub router gate [hidden_size,1] -> always route to expert 0
+            auto ctx = embed_tokens->ctx.lock();
+            auto gate_stub = ow::nn::Tensor::create(ctx, std::vector<int>{hidden_size, 1}, DType::FLOAT32);
+            for (size_t gi = 0; gi < gate_stub->nelements(); ++gi) gate_stub->set_from_float_flat(gi, 0.0f);
+            moe = std::make_shared<SparseMoEBlock>(gate_stub, experts, 1);
+            std::cout << "[MLP] Using dense SwiGLU MLP for layer " << i << std::endl;
         } else {
-            // Fallback: ensure weights are 2D and build a single expert; infer I from dims
-            int I = -1;
-            if (experts_gate_up_proj && experts_gate_up_proj->shape.size() == 2) {
-                // Orient to [hidden_size, 2I] if needed
-                auto gu_oriented = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
-                int GU = gu_oriented->shape[1];
-                I = GU / 2;
-                // Slice gate/up from 2D by view
-                auto gate_e = gu_oriented->slice_view({0, 0}, {hidden_size, I});
-                auto up_e = gu_oriented->slice_view({0, I}, {hidden_size, I});
-                gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
-                up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
-                // Down oriented to [I, hidden_size]
-                auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, I, hidden_size);
-                experts.push_back(std::make_shared<Expert>(gate_e, up_e, down2d));
+            auto gate_weight = ensure_linear_weight_or_transpose(gate_weight_raw, hidden_size);
+            // Derive router expert count from gate weight dims (supports transposed layout)
+            int router_experts = (gate_weight->shape[0] == hidden_size)
+                                   ? gate_weight->shape[1]
+                                   : gate_weight->shape[0];
+            std::cout << "[MoE] Router experts from gate weight: " << router_experts << std::endl;
+            
+            // Prepare expert container
+            if (experts_gate_up_proj && experts_down_proj &&
+                experts_gate_up_proj->shape.size() == 3 && experts_down_proj->shape.size() == 3) {
+                int E = experts_gate_up_proj->shape[0];
+                int H = experts_gate_up_proj->shape[1];
+                int GU = experts_gate_up_proj->shape[2]; // gate+up merged
+                int I_down = experts_down_proj->shape[1];
+                int H_down = experts_down_proj->shape[2];
+                int I = I_down;
+                if (I <= 0 || (GU % 2) != 0) I = GU / 2;
+                intermediate_size = (intermediate_size < 0) ? I : intermediate_size;
+                int build_E = std::min(E, router_experts);
+                std::cout << "[MoE] Slicing merged experts: E=" << E
+                          << " H=" << H << " GU=" << GU
+                          << " -> inferred I=" << I << " H_down=" << H_down
+                          << " build_E=" << build_E << std::endl;
+                for (int e = 0; e < build_E; ++e) {
+                    auto gate_e_3d = experts_gate_up_proj->slice_view({e, 0, 0}, {1, H, I});
+                    auto gate_e = gate_e_3d->view({H, I}, {gate_e_3d->strides[1], gate_e_3d->strides[2]});
+                    gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
+                    auto up_e_3d = experts_gate_up_proj->slice_view({e, 0, I}, {1, H, I});
+                    auto up_e = up_e_3d->view({H, I}, {up_e_3d->strides[1], up_e_3d->strides[2]});
+                    up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
+                    auto down_e_3d = experts_down_proj->slice_view({e, 0, 0}, {1, I, hidden_size});
+                    auto down_e = down_e_3d->reshape_view({I, hidden_size});
+                    down_e = ensure_linear_weight_or_transpose(down_e, I, hidden_size);
+                    experts.push_back(std::make_shared<Expert>(gate_e, up_e, down_e));
+                }
+                std::cout << "[MoE] Built " << experts.size() << " experts with 2D weights (gate/up/down)" << std::endl;
             } else {
-                // If shapes unexpected, just pass through using up/down only
-                auto up2d = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
-                auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, hidden_size);
-                experts.push_back(std::make_shared<Expert>(nullptr, up2d, down2d));
+                int I = -1;
+                if (experts_gate_up_proj && experts_gate_up_proj->shape.size() == 2) {
+                    auto gu_oriented = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
+                    int GU = gu_oriented->shape[1];
+                    I = GU / 2;
+                    auto gate_e = gu_oriented->slice_view({0, 0}, {hidden_size, I});
+                    auto up_e = gu_oriented->slice_view({0, I}, {hidden_size, I});
+                    gate_e = ensure_linear_weight_or_transpose(gate_e, hidden_size, I);
+                    up_e = ensure_linear_weight_or_transpose(up_e, hidden_size, I);
+                    auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, I, hidden_size);
+                    experts.push_back(std::make_shared<Expert>(gate_e, up_e, down2d));
+                } else {
+                    auto up2d = ensure_linear_weight_or_transpose(experts_gate_up_proj, hidden_size);
+                    auto down2d = ensure_linear_weight_or_transpose(experts_down_proj, hidden_size);
+                    experts.push_back(std::make_shared<Expert>(nullptr, up2d, down2d));
+                }
+                std::cout << "[MoE] Built merged single expert (fallback)" << std::endl;
             }
-            std::cout << "[MoE] Built merged single expert (fallback)" << std::endl;
+            moe = std::make_shared<SparseMoEBlock>(gate_weight, experts, top_k);
         }
-        
-        // Build MoE block
-        auto moe = std::make_shared<SparseMoEBlock>(gate_weight, experts, top_k);
         
         // Layer norms
-        auto input_layernorm_weight = get_weight(layer_prefix + "input_layernorm.weight");
-        auto post_attention_layernorm_weight = get_weight(layer_prefix + "post_attention_layernorm.weight");
+        TensorPtr input_layernorm_weight, post_attention_layernorm_weight;
+        for (const auto &lp : layer_prefixes) {
+            if (!input_layernorm_weight) input_layernorm_weight = get_weight(lp + "input_layernorm.weight");
+            if (!post_attention_layernorm_weight) post_attention_layernorm_weight = get_weight(lp + "post_attention_layernorm.weight");
+        }
         
         if (!input_layernorm_weight || !post_attention_layernorm_weight) {
             std::cerr << "Warning: Missing layer norm weights for layer " << i << std::endl;
@@ -782,8 +879,11 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         layers.push_back(decoder_layer);
     }
     
-    // Final layer norm
+    // Final layer norm (robust to different prefixes)
     auto norm_weight = get_weight("model.norm.weight");
+    if (!norm_weight) norm_weight = get_weight("model.language_model.norm.weight");
+    if (!norm_weight) norm_weight = get_weight("language_model.norm.weight");
+    if (!norm_weight) norm_weight = get_weight("norm.weight");
     if (!norm_weight) {
         throw std::runtime_error("WeightLoader: model.norm.weight not found");
     }

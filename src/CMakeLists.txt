@@ -2,6 +2,7 @@
 set(SOURCES
     tokenizer.cpp
     transformer.cpp
+    sampler.cpp
     context.hpp
     thread_pool.hpp
     tensor.hpp

@@ -21,6 +21,7 @@
 #include "src/tensor.hpp"
 #include "src/memory_optimizer.hpp"
 #include "include/tokenizer.h"
+#include "include/sampler.h"
 #include <unordered_map>
 
 // Default asset and weight paths for local testing
@@ -41,20 +42,19 @@ static bool str_contains(const std::string &s, const std::string &sub) {
 
 static const char* dtype_to_cstr(ow::nn::DType dt) {
   switch (dt) {
-    case ow::nn::DType::FLOAT32:   return "float32";
-    case ow::nn::DType::INT32:     return "int32";
-    case ow::nn::DType::FP16:      return "fp16";
-    case ow::nn::DType::BF16:      return "bf16";
-    case ow::nn::DType::INT8:      return "int8";
-    case ow::nn::DType::Q4_0:      return "q4_0";
-    case ow::nn::DType::U8:        return "u8";
-    case ow::nn::DType::BOOL:      return "bool";
-    case ow::nn::DType::I16:       return "i16";
-    case ow::nn::DType::I64:       return "i64";
-    case ow::nn::DType::F64:       return "f64";
-    case ow::nn::DType::FP8_E4M3:  return "fp8_e4m3";
-    case ow::nn::DType::FP8_E5M2:  return "fp8_e5m2";
-    default: return "unknown";
+    case ow::nn::DType::FLOAT32: return "F32";
+    case ow::nn::DType::FP16: return "F16";
+    case ow::nn::DType::BF16: return "BF16";
+    case ow::nn::DType::INT32: return "I32";
+    case ow::nn::DType::INT8: return "I8";
+    case ow::nn::DType::U8: return "U8";
+    case ow::nn::DType::BOOL: return "BOOL";
+    case ow::nn::DType::I16: return "I16";
+    case ow::nn::DType::I64: return "I64";
+    case ow::nn::DType::F64: return "F64";
+    case ow::nn::DType::FP8_E4M3: return "F8_E4M3";
+    case ow::nn::DType::FP8_E5M2: return "F8_E5M2";
+    default: return "?";
   }
 }
 
@@ -75,25 +75,14 @@ static std::vector<ModuleInfo> map_modules(const std::vector<std::string> &names
   return mods;
 }
 
-// 解析层索引（如 "model.layers.13." 或 "model.language_model.layers.13.")
 static int parse_layer_index(const std::string &name) {
-  const std::string a = "model.layers.";
-  const std::string b = "model.language_model.layers.";
-  size_t p = std::string::npos;
-  if ((p = name.find(a)) != std::string::npos) {
-    p += a.size();
-  } else if ((p = name.find(b)) != std::string::npos) {
-    p += b.size();
-  } else {
-    return -1;
-  }
-  int val = -1;
-  size_t idx = p;
-  while (idx < name.size() && isdigit(static_cast<unsigned char>(name[idx]))) { idx++; }
-  if (idx > p) {
-    try { val = std::stoi(name.substr(p, idx - p)); } catch(...) { val = -1; }
-  }
-  return val;
+  size_t pos = name.find(".layers.");
+  if (pos == std::string::npos) return -1;
+  pos += 8; // skip ".layers."
+  std::string num;
+  while (pos < name.size() && std::isdigit((unsigned char)name[pos])) num.push_back(name[pos++]);
+  if (num.empty()) return -1;
+  return std::stoi(num);
 }
 
 static bool is_expert_weight(const std::string &name) {
@@ -115,8 +104,6 @@ std::vector<std::pair<int, float>> topk_indices_from_logits(const ow::nn::Tensor
     for (int i = 0; i < vocab; ++i) {
         float v = logits->get_as_float_flat(i);
         if (!std::isfinite(v)) continue;
-        if (v > 100.0f) v = 100.0f;
-        if (v < -100.0f) v = -100.0f;
         if ((int)topk.size() < k) {
             topk.emplace_back(i, v);
             if ((int)topk.size() == k) {
@@ -143,7 +130,6 @@ static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const 
     if (!ctx) throw std::runtime_error("matvec_rows_dot: missing context");
     auto out = ow::nn::Tensor::create(ctx, {1, V}, ow::nn::DType::FLOAT32);
     
-    // 计算输入的数值范围，用于自适应裁剪
     float hidden_max = 0.0f;
     for (int k = 0; k < K; ++k) {
         float val = hidden->get_as_float_flat(k);
@@ -152,50 +138,31 @@ static ow::nn::TensorPtr matvec_rows_dot(const ow::nn::TensorPtr &hidden, const 
         }
     }
     
-    // Compute logits row-by-row against embedding/lm_head rows
     for (int j = 0; j < V; ++j) {
-        double acc = 0.0;  // 使用双精度累加减少误差
+        double acc = 0.0;
         size_t baseE = (size_t)j * (size_t)K;
         for (int k = 0; k < K; ++k) {
             float a = hidden->get_as_float_flat(k);
             float b = E->get_as_float_flat(baseE + k);
-            
-            // 检查输入数值的有效性
             if (!std::isfinite(a)) a = 0.0f;
             if (!std::isfinite(b)) b = 0.0f;
-            
-            // 防止单个乘法结果过大
             double prod = static_cast<double>(a) * static_cast<double>(b);
             if (!std::isfinite(prod)) prod = 0.0;
-            if (prod > 1e6) prod = 1e6;
-            if (prod < -1e6) prod = -1e6;
-            
             acc += prod;
         }
-        
-        // 转换回单精度并进行最终裁剪
         float result = static_cast<float>(acc);
         if (!std::isfinite(result)) result = 0.0f;
-        
-        // 更合理的数值范围，基于模型规模调整
-        float max_logit = 50.0f;  // 增加到50，但仍然防止softmax溢出
-        if (result > max_logit) result = max_logit;
-        if (result < -max_logit) result = -max_logit;
-        
         out->set_from_float_flat(j, result);
     }
     return out;
 }
 
-// Normalize weight names: strip 'model.language_model.' to 'model.' if present
 static std::string normalize_weight_name(const std::string &name) {
-    const std::string prefix = "model.language_model.";
-    if (name.rfind(prefix, 0) == 0) {
-        std::string normalized = std::string("model.") + name.substr(prefix.size());
-        std::cout << "[WeightMap] " << name << " -> " << normalized << std::endl;
-        return normalized;
-    }
-    return name;
+  if (name.rfind("model.language_model", 0) == 0) return name;
+  if (name.rfind("model.", 0) == 0) return name;
+  if (name == "embed_tokens.weight") return std::string("model.embed_tokens.weight");
+  if (name == "lm_head.weight") return std::string("lm_head.weight");
+  return name;
 }
 
 // 规范化 token 字符串：将常见分词标记替换为空格
@@ -230,7 +197,6 @@ static int argmax_logits(const ow::nn::TensorPtr &logits) {
     
     for (int i = 0; i < V; ++i) {
         float v = logits->get_as_float_flat(i);
-        // 跳过非有限值
         if (!std::isfinite(v)) continue;
         valid_count++;
         if (v > maxv) { 
@@ -239,7 +205,6 @@ static int argmax_logits(const ow::nn::TensorPtr &logits) {
         }
     }
     
-    // 如果没有有效的logits值，返回0作为默认值
     if (valid_count == 0) {
         std::cerr << "[WARNING] No valid logits found, using token 0" << std::endl;
         return 0;
@@ -260,6 +225,33 @@ int main(int argc, char **argv) {
   if (argc >= 4) {
     weights_dir = argv[3];
   }
+
+  // Generation flags
+  bool greedy = false;
+  bool verbose = false;
+  int verbose_every = 10;
+  float temperature = 0.7f;
+  float top_p = 0.9f;
+  uint32_t top_k = 50;
+  float repetition_penalty = 1.0f; // 1.0 means disabled
+
+  for (int i = 4; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--greedy") greedy = true;
+    else if (arg == "--verbose") verbose = true;
+    else if (arg.rfind("--verbose_every=", 0) == 0) {
+      verbose_every = std::max(1, std::stoi(arg.substr(17)));
+    } else if (arg.rfind("--temperature=", 0) == 0) {
+      temperature = std::stof(arg.substr(14));
+    } else if (arg.rfind("--top_p=", 0) == 0) {
+      top_p = std::stof(arg.substr(8));
+    } else if (arg.rfind("--top_k=", 0) == 0) {
+      top_k = (uint32_t)std::stoul(arg.substr(8));
+    } else if (arg.rfind("--repetition_penalty=", 0) == 0) {
+      repetition_penalty = std::stof(arg.substr(22));
+    }
+  }
+
   std::cout << "Assets: " << vocab_path << " | " << merges_path << std::endl;
 
   try {
@@ -276,7 +268,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Wrap the weights summary within an outer try/catch to avoid else-parsing issues
   try {
     if (!weights_dir.empty()) {
       ow::nn::SafetensorsLoader loader;
@@ -388,7 +379,6 @@ int main(int argc, char **argv) {
     auto mha = std::make_shared<MultiHeadAttention>(q_proj, k_proj, v_proj, o_proj, qnw, knw, num_heads, num_kv_heads, hidden_size);
 
     auto hidden = mk({seq_len, hidden_size});
-    // Sanity: print hidden first row before MHA
     std::cout << "[Sanity] hidden dtype=" << (int)hidden->dtype << " row0: ";
     for (int h=0; h<hidden_size; ++h) {
       std::cout << hidden->get_as_float_flat((size_t)h) << (h+1<hidden_size?",":"");
@@ -411,23 +401,27 @@ int main(int argc, char **argv) {
     ow::nn::LazySafetensorsLoader gen_loader;
     gen_loader.load_dir(model_dir);
     
-    // Use MemoryOptimizer to determine optimal context size
     size_t optimal_size = ow::nn::MemoryOptimizer::get_optimal_initial_context_size();
     auto gen_ctx = std::make_shared<ow::nn::Context>(optimal_size);
     
     std::cout << "[GEN] Using optimized context size: " 
               << (optimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
     
-    // Use MemoryOptimizer for intelligent weight loading
     std::vector<std::string> weight_patterns = {
         "model.language_model",
-        "model.embed_tokens", 
+        "language_model",
+        "model.layers",
+        "layers.",
+        "model.embed_tokens",
+        "embed_tokens",
+        "wte",
         "model.norm",
+        "norm.weight",
         "lm_head"
     };
     
     auto all_weights = ow::nn::MemoryOptimizer::load_weights_optimized(
-        gen_loader, gen_ctx, weight_patterns, true // use memory mapping
+        gen_loader, gen_ctx, weight_patterns, true
     );
 
     ow::nn::WeightLoader wl;
@@ -436,7 +430,6 @@ int main(int argc, char **argv) {
     }
     auto model = wl.build_model();
 
-    // Prefer tokenizer in model dir, fallback to assets
     std::string vocab_path_m = model_dir + "\\vocab.json";
     std::string merges_path_m = model_dir + "\\merges.txt";
     std::string vocab_path_final = vocab_path;
@@ -456,7 +449,6 @@ int main(int argc, char **argv) {
       if (question == "/exit") break;
       if (question.empty()) continue;
 
-      // Build simple Q&A-style prompt with minimal history
       std::string prompt_text;
       for (auto &turn : history) {
         prompt_text += "User: " + turn.first + "\n";
@@ -470,10 +462,18 @@ int main(int argc, char **argv) {
       int consecutive_empty_tokens = 0;
       int nextTokenId = -1;
       bool placeholder = false;
+
+      sampler sp;
+      sp.temperature = temperature;
+      sp.top_p = top_p;
+      sp.top_k = top_k;
+      sp.repetition_penalty = repetition_penalty;
+      sp.apply_softmax = true;
+      sp.do_sample = !greedy;
+
       for (int step = 0; step < max_new_tokens; ++step) {
         auto hidden_states = model->forward(ids);
         
-        // Check for NaN in hidden states
         bool has_nan = false;
         size_t n = hidden_states->nelements();
         for (size_t i = 0; i < std::min(n, size_t(100)); ++i) {
@@ -498,7 +498,6 @@ int main(int argc, char **argv) {
 
         auto logits = ow::nn::Tensor::matvec_blocked_mt(last_hidden, vocab_weight);
         
-        // Check for NaN in logits
         has_nan = false;
         n = logits->nelements();
         for (size_t i = 0; i < n; ++i) {
@@ -512,31 +511,45 @@ int main(int argc, char **argv) {
           break;
         }
         
-        // Optional: print top-5 for debugging
-        auto top5 = topk_indices_from_logits(logits, 5);
-        std::cout << "[DBG top-5] ";
-        for (const auto &p : top5) { std::cout << "(" << p.first << ":" << p.second << ") "; }
-        std::cout << "\n";
+        if (verbose && (step % verbose_every == 0)) {
+          auto top5 = topk_indices_from_logits(logits, 5);
+          std::cout << "[DBG top-5] ";
+          for (const auto &p : top5) { std::cout << "(" << p.first << ":" << p.second << ") "; }
+          std::cout << "\n";
+        }
 
-        // 选择下一个 token：全量 argmax（更稳健）
-        nextTokenId = argmax_logits(logits);
+        if (greedy) {
+          nextTokenId = argmax_logits(logits);
+        } else {
+          int V = logits->shape[1];
+          sp.vocab_size = (uint32_t)V;
+          std::vector<float> logit_vec(V);
+          for (int i = 0; i < V; ++i) logit_vec[i] = logits->get_as_float_flat(i);
+          std::vector<uint32_t> out_ids;
+          sp.sample(logit_vec.data(), out_ids);
+          if (out_ids.empty()) {
+            nextTokenId = argmax_logits(logits);
+          } else {
+            nextTokenId = (int)out_ids.back();
+          }
+        }
         ids.push_back(nextTokenId);
 
-        // 解码并规范化
         std::string piece_raw = tok.decode_id(nextTokenId);
         std::string piece = normalize_token_str(piece_raw);
 
-        // EOS 停止条件
-        if (piece == "</s>" || piece == "<|endoftext|>" || piece == "<|im_end|>") {
+        if (verbose && (step % verbose_every == 0)) {
+          std::cout << "[tok] id=" << nextTokenId << " raw=\"" << piece_raw << "\"" << std::endl;
+        }
+
+        if (piece == "</s>" || piece == " ") {
           std::cout << "\n[GEN] EOS reached." << std::endl;
           break;
         }
 
-        // 输出并累积
         std::cout << piece << std::flush;
         answer += piece;
 
-        // 检查连续空白/不可打印（但未知占位符不记入空白）
         placeholder = piece.size() >= 4 && piece.find("<id=") != std::string::npos;
         if (!placeholder && (piece.empty() || piece == " " || piece == "\t")) {
           consecutive_empty_tokens++;

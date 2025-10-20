@@ -151,3 +151,5 @@ llama.cpp
 llama.cpp/**
 third_party/llama.cpp
 model
+model2
+model2/**

@@ -7,29 +7,25 @@
 #include <stdint.h>
 #include <vector>
 
-// currently this is only built to support single squence output smapling
-// without beam search.
+// simple single sequence output sampler without beam search
 struct sampler {
-  // these default configurations are based on the generation configuration for
-  // Parler TTS mini (vesion 1.0)
-  uint32_t n_output_heads = 9;
-  uint32_t eos_token_id = 1024;
-  uint32_t vocab_size = 1088;
+  // runtime-configurable generation settings
+  uint32_t eos_token_id = 0; // 0 means unknown/unused
+  uint32_t vocab_size = 0;   // must be set from model weights
   float temperature = 1.0f;
   uint32_t top_k = 0;
   float top_p = 1.0f;
-  float repetition_penalty = 1.0f;
-  std::vector<int32_t> last_token_ids;
-  std::vector<int32_t> repetition_counts;
+  float repetition_penalty = 1.0f; // 1.0 disables
+  std::vector<uint32_t> last_token_ids;
   bool do_sample = true;
   bool apply_softmax = true;
+  size_t last_max_keep = 128; // keep at most N recent ids for repetition penalty
 
   void sample(float *logits, std::vector<uint32_t> &output_tokens);
   void softmax(float *logits, std::vector<std::vector<size_t>> picks,
                std::vector<uint32_t> max_indices);
   void max(float *logits, std::vector<uint32_t> &output_tokens);
-  std::vector<std::vector<size_t>> topk(float *logits, bool performed_softmax);
-  void topp(float *logits, std::vector<std::vector<size_t>> &picks,
-            std::vector<float> &max_head_probs);
-  void reset();
+  void topk(float *probs, std::vector<uint32_t>& out_indices);
+  void topp(float *probs, std::vector<uint32_t>& out_indices);
+  void reset(size_t keep_last_n = 128);
 };

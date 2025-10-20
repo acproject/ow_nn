@@ -98,10 +98,14 @@ public:
             
             // Categorize weights
             if (name.find("embed_tokens") != std::string::npos ||
+                name.find("wte") != std::string::npos ||
                 name.find("lm_head") != std::string::npos ||
-                name.find("model.norm") != std::string::npos) {
+                name.find("model.norm") != std::string::npos ||
+                name.find("norm.weight") != std::string::npos) {
                 essential_weights.push_back(name);
-            } else if (name.find("language_model.layers") != std::string::npos) {
+            } else if (name.find("language_model.layers") != std::string::npos ||
+                       name.find("model.layers") != std::string::npos ||
+                       name.find("layers.") != std::string::npos) {
                 layer_weights.push_back(name);
             }
         }
