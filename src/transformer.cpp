@@ -179,6 +179,16 @@ static bool ow_verbose_moe() {
     return v != nullptr && v[0] != '0';
 }
 
+static float ow_env_rope_base() {
+    const char* v = std::getenv("OWNN_ROPE_BASE");
+    if (!v || v[0] == '\0') v = std::getenv("ROPE_THETA");
+    if (!v || v[0] == '\0') return 10000.0f;
+    char* end = nullptr;
+    float val = std::strtof(v, &end);
+    if (end == v || !std::isfinite(val) || val <= 0.0f) return 10000.0f;
+    return val;
+}
+
 MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr& k_proj, 
                                      const TensorPtr& v_proj, const TensorPtr& o_proj,
                                      const TensorPtr& q_norm_weight, const TensorPtr& k_norm_weight,
@@ -230,7 +240,13 @@ MultiHeadAttention::MultiHeadAttention(const TensorPtr& q_proj, const TensorPtr&
     }
     q_norm = std::make_shared<RMSNorm>(q_norm_weight);
     k_norm = std::make_shared<RMSNorm>(k_norm_weight);
-    rotary_emb = std::make_shared<RotaryEmbedding>(head_dim);
+    {
+        float rope_base = ow_env_rope_base();
+        if (ow_verbose_rope()) {
+            std::cout << "[RoPE] base=" << rope_base << " dim=" << head_dim << std::endl;
+        }
+        rotary_emb = std::make_shared<RotaryEmbedding>(head_dim, 2048, rope_base);
+    }
 
     // KV cache state
     cache_len = 0;
@@ -928,3 +944,4 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
 }
 
 } // namespace ow::nn
+

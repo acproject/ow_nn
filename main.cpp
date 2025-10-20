@@ -533,6 +533,13 @@ int main(int argc, char **argv) {
       sp.apply_softmax = true;
       sp.do_sample = !greedy;
 
+      ow::nn::TensorPtr vocab_weight = wl.get_weight("lm_head.weight");
+      if (!vocab_weight) vocab_weight = wl.get_weight("model.lm_head.weight");
+      if (!vocab_weight) vocab_weight = wl.get_weight("model.embed_tokens.weight");
+      if (!vocab_weight) throw std::runtime_error("No vocab projection weight found");
+      // Convert to FLOAT32 once for stable logits computation
+      vocab_weight = vocab_weight->astype(ow::nn::DType::FLOAT32);
+
       for (int step = 0; step < max_new_tokens; ++step) {
         auto hidden_states = model->forward(ids);
         
@@ -553,10 +560,7 @@ int main(int argc, char **argv) {
         int hidden_size2 = hidden_states->shape[1];
         auto last_hidden = hidden_states->slice_view({seq_len2 - 1, 0}, {1, hidden_size2});
 
-        ow::nn::TensorPtr vocab_weight = wl.get_weight("lm_head.weight");
-        if (!vocab_weight) vocab_weight = wl.get_weight("model.lm_head.weight");
-        if (!vocab_weight) vocab_weight = wl.get_weight("model.embed_tokens.weight");
-        if (!vocab_weight) throw std::runtime_error("No vocab projection weight found");
+        // using pre-fetched vocab_weight (FLOAT32)
 
         auto logits = ow::nn::Tensor::matvec_blocked_mt(last_hidden, vocab_weight);
         
