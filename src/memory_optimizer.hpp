@@ -54,17 +54,17 @@ public:
         double available_gb = get_available_memory_gb();
         
         if (available_gb < 8.0) {
-            // Low memory system: start with 512MB
-            return 512ull * 1024ull * 1024ull;
-        } else if (available_gb < 16.0) {
-            // Medium memory system: start with 1GB
+            // Low memory system: start with 1GB
             return 1ull * 1024ull * 1024ull * 1024ull;
-        } else if (available_gb < 32.0) {
-            // High memory system: start with 2GB
+        } else if (available_gb < 16.0) {
+            // Medium memory system: start with 2GB
             return 2ull * 1024ull * 1024ull * 1024ull;
+        } else if (available_gb < 32.0) {
+            // High memory system: start with 6GB
+            return 6ull * 1024ull * 1024ull * 1024ull;
         } else {
-            // Very high memory system: start with 4GB
-            return 4ull * 1024ull * 1024ull * 1024ull;
+            // Very high memory system: start with 8GB
+            return 8ull * 1024ull * 1024ull * 1024ull;
         }
     }
     

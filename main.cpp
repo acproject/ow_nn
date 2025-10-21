@@ -541,7 +541,19 @@ int main(int argc, char **argv) {
       vocab_weight = vocab_weight->astype(ow::nn::DType::FLOAT32);
 
       for (int step = 0; step < max_new_tokens; ++step) {
-        auto hidden_states = model->forward(ids);
+        // Check memory usage before each generation step
+        try {
+          // Create 3D position IDs for MRoPE-Interleave: [3, 1, seq_len] where 3 = [T, H, W]
+          // For text-only generation: T = token_position, H = 1, W = 1
+          int seq_len = (int)ids.size();
+        auto position_ids = ow::nn::Tensor::create(gen_ctx, {3, 1, seq_len}, ow::nn::DType::FLOAT32);
+        for (int i = 0; i < seq_len; ++i) {
+            position_ids->set_from_float_flat(0 * seq_len + i, (float)i);  // T dimension: token position
+            position_ids->set_from_float_flat(1 * seq_len + i, 1.0f);      // H dimension: height = 1 for text
+            position_ids->set_from_float_flat(2 * seq_len + i, 1.0f);      // W dimension: width = 1 for text
+        }
+        
+        auto hidden_states = model->forward(ids, position_ids);
         
         bool has_nan = false;
         size_t n = hidden_states->nelements();
@@ -559,6 +571,21 @@ int main(int argc, char **argv) {
         int seq_len2 = (int)ids.size();
         int hidden_size2 = hidden_states->shape[1];
         auto last_hidden = hidden_states->slice_view({seq_len2 - 1, 0}, {1, hidden_size2});
+
+        // Debug: print shapes
+        std::ostringstream debug_ss;
+        debug_ss << "last_hidden shape: [";
+        for (size_t i = 0; i < last_hidden->shape.size(); ++i) {
+          if (i > 0) debug_ss << ", ";
+          debug_ss << last_hidden->shape[i];
+        }
+        debug_ss << "], vocab_weight shape: [";
+        for (size_t i = 0; i < vocab_weight->shape.size(); ++i) {
+          if (i > 0) debug_ss << ", ";
+          debug_ss << vocab_weight->shape[i];
+        }
+        debug_ss << "]";
+        ow::nn::log(ow::nn::LogLevel::INFO, "GEN", debug_ss.str());
 
         // using pre-fetched vocab_weight (FLOAT32)
 
@@ -634,12 +661,35 @@ int main(int argc, char **argv) {
         }
 
         if (!piece.empty() && piece.back() == '\n') { break; }
+        } catch (const std::bad_alloc &e) {
+          ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Memory allocation failed during generation step " + std::to_string(step) + ": " + std::string(e.what()));
+          std::cerr << "[ERROR] Out of memory at generation step " << step << ". Stopping generation." << std::endl;
+          break;
+        } catch (const std::exception &e) {
+          ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Error during generation step " + std::to_string(step) + ": " + std::string(e.what()));
+          std::cerr << "[ERROR] Error at generation step " << step << ": " << e.what() << std::endl;
+          break;
+        }
       }
       std::cout << std::endl;
       history.emplace_back(question, answer);
     }
+  } catch (const std::bad_alloc &e) {
+    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Memory allocation failed: " + std::string(e.what()));
+    std::cerr << "[ERROR] Out of memory during generation. Try reducing model size or increasing system memory." << std::endl;
+    return 1;
+  } catch (const std::runtime_error &e) {
+    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Runtime error: " + std::string(e.what()));
+    std::cerr << "[ERROR] Runtime error: " << e.what() << std::endl;
+    return 1;
   } catch (const std::exception &e) {
-    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", std::string("Error: ") + e.what());
+    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Unexpected error: " + std::string(e.what()));
+    std::cerr << "[ERROR] Unexpected error: " << e.what() << std::endl;
+    return 1;
+  } catch (...) {
+    ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Unknown error occurred");
+    std::cerr << "[ERROR] Unknown error occurred during generation" << std::endl;
+    return 1;
   }
 
   return 0;

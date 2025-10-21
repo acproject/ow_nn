@@ -25,19 +25,31 @@ public:
     TensorPtr forward(const TensorPtr& x);
 };
 
-// Rotary positional embedding
+// Rotary positional embedding with MRoPE-Interleave support for Qwen3-VL
 class RotaryEmbedding {
 public:
     int dim;
     int max_seq_len;
     float base;
+    float attention_scaling;
+    std::vector<int> mrope_section;  // [t_section, h_section, w_section] for MRoPE-Interleave
     TensorPtr cos_cached;
     TensorPtr sin_cached;
     
-    RotaryEmbedding(int dim, int max_seq_len = 2048, float base = 10000.0f);
+    RotaryEmbedding(int dim, int max_seq_len = 2048, float base = 10000.0f, 
+                   float attention_scaling = 1.0f, const std::vector<int>& mrope_section = {24, 20, 20});
     
+    // Standard 2D RoPE
     std::pair<TensorPtr, TensorPtr> forward(int seq_len, const std::shared_ptr<Context>& ctx);
+    
+    // MRoPE-Interleave for 3D position encoding (T, H, W)
+    std::pair<TensorPtr, TensorPtr> forward_mrope(const TensorPtr& position_ids, const std::shared_ptr<Context>& ctx);
+    
     TensorPtr apply_rotary_pos_emb(const TensorPtr& x, const TensorPtr& cos, const TensorPtr& sin);
+    
+private:
+    // Apply interleaved MRoPE to 3D rotary embeddings
+    TensorPtr apply_interleaved_mrope(const TensorPtr& freqs, const std::vector<int>& mrope_section);
 };
 
 // Multi-Head Attention
@@ -71,6 +83,9 @@ public:
     void init_cache(const std::shared_ptr<Context>& ctx, int max_seq_len);
     
     TensorPtr forward(const TensorPtr& hidden_states, int seq_len);
+    
+    // Forward with 3D position IDs for MRoPE-Interleave
+    TensorPtr forward(const TensorPtr& hidden_states, int seq_len, const TensorPtr& position_ids);
 };
 
 // MoE Expert
@@ -117,6 +132,9 @@ public:
           input_layernorm(input_layernorm), post_attention_layernorm(post_attention_layernorm) {}
     
     TensorPtr forward(const TensorPtr& hidden_states, int seq_len);
+    
+    // Forward with 3D position IDs for MRoPE-Interleave
+    TensorPtr forward(const TensorPtr& hidden_states, int seq_len, const TensorPtr& position_ids);
 };
 
 // Qwen3VL Text Model
@@ -140,6 +158,9 @@ public:
                     int num_heads, int num_kv_heads);
     
     TensorPtr forward(const std::vector<int>& input_ids);
+    
+    // Forward with 3D position IDs for MRoPE-Interleave
+    TensorPtr forward(const std::vector<int>& input_ids, const TensorPtr& position_ids);
 };
 
 // Lightweight WeightLoader interface
