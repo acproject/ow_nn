@@ -1114,11 +1114,12 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         extract("model.layers.");
     }
     if (max_layer_index >= 0) num_layers = max_layer_index + 1;
-    const int num_heads = 32;
-    const int num_kv_heads = 4;
-    int intermediate_size = -1;  // infer from weights when available
-    const int num_experts = 128;
-    const int top_k = 8;
+    int num_heads = 32;
+    int num_kv_heads = 4;
+
+    // Infer head_dim/num_heads/num_kv_heads from first available layer weights
+    int inferred_head_dim = -1;
+    bool inferred_ok = false;
     
     // Get embedding weights (robust to different prefixes)
     auto embed_tokens = get_weight("model.embed_tokens.weight");
@@ -1136,6 +1137,48 @@ std::shared_ptr<Qwen3VLTextModel> WeightLoader::build_model() {
         throw std::runtime_error("WeightLoader: invalid hidden_size inferred from embed_tokens");
     }
     std::cout << "[CFG] hidden_size=" << hidden_size << std::endl;
+
+    for (int li = 0; li < num_layers && !inferred_ok; ++li) {
+        std::vector<std::string> layer_prefixes = {
+            std::string("model.layers.") + std::to_string(li) + ".",
+            std::string("model.language_model.layers.") + std::to_string(li) + ".",
+            std::string("language_model.layers.") + std::to_string(li) + "."
+        };
+        TensorPtr q_proj_raw_probe, k_proj_raw_probe, v_proj_raw_probe, q_norm_weight_probe;
+        for (const auto &lp : layer_prefixes) {
+            if (!q_proj_raw_probe) q_proj_raw_probe = get_weight(lp + "self_attn.q_proj.weight");
+            if (!k_proj_raw_probe) k_proj_raw_probe = get_weight(lp + "self_attn.k_proj.weight");
+            if (!v_proj_raw_probe) v_proj_raw_probe = get_weight(lp + "self_attn.v_proj.weight");
+            if (!q_norm_weight_probe) q_norm_weight_probe = get_weight(lp + "self_attn.q_norm.weight");
+        }
+        if (q_proj_raw_probe && k_proj_raw_probe && v_proj_raw_probe && q_norm_weight_probe) {
+            auto q_proj_oriented = ensure_linear_weight_or_transpose(q_proj_raw_probe, hidden_size);
+            auto k_proj_oriented = ensure_linear_weight_or_transpose(k_proj_raw_probe, hidden_size);
+            auto v_proj_oriented = ensure_linear_weight_or_transpose(v_proj_raw_probe, hidden_size);
+            int q_out = (q_proj_oriented->shape.size()==2) ? q_proj_oriented->shape[1] : -1;
+            int k_out = (k_proj_oriented->shape.size()==2) ? k_proj_oriented->shape[1] : -1;
+            int v_out = (v_proj_oriented->shape.size()==2) ? v_proj_oriented->shape[1] : -1;
+            int hd_from_norm = (int)q_norm_weight_probe->nelements();
+            if (hd_from_norm > 0) inferred_head_dim = hd_from_norm;
+            if (inferred_head_dim > 0) {
+                int heads_candidate = hidden_size / inferred_head_dim;
+                int kv_heads_candidate = (k_out > 0) ? (k_out / inferred_head_dim) : -1;
+                if (heads_candidate > 0 && kv_heads_candidate > 0) {
+                    num_heads = heads_candidate;
+                    num_kv_heads = kv_heads_candidate;
+                    inferred_ok = true;
+                    std::cout << "[CFG] inferred num_heads=" << num_heads
+                              << " num_kv_heads=" << num_kv_heads
+                              << " head_dim=" << inferred_head_dim
+                              << " (q_out=" << q_out << ", k_out=" << k_out << ", v_out=" << v_out << ")" << std::endl;
+                }
+            }
+        }
+    }
+
+    int intermediate_size = -1;  // infer from weights when available
+    const int num_experts = 128;
+    const int top_k = 8;
     
     // Build decoder layers
     std::vector<std::shared_ptr<DecoderLayer>> layers;
