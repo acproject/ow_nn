@@ -53,18 +53,19 @@ public:
     static size_t get_optimal_initial_context_size() {
         double available_gb = get_available_memory_gb();
         
-        if (available_gb < 8.0) {
-            // Low memory system: start with 1GB
-            return 1ull * 1024ull * 1024ull * 1024ull;
-        } else if (available_gb < 16.0) {
-            // Medium memory system: start with 2GB
-            return 2ull * 1024ull * 1024ull * 1024ull;
-        } else if (available_gb < 32.0) {
-            // High memory system: start with 6GB
-            return 6ull * 1024ull * 1024ull * 1024ull;
+        // More aggressive initial sizing for large models to reduce reallocations
+        if (available_gb >= 48.0) {
+            return 16ULL * 1024 * 1024 * 1024; // 16GB for very high-memory systems
+        } else if (available_gb >= 32.0) {
+            return 12ULL * 1024 * 1024 * 1024; // 12GB for high-memory systems
+        } else if (available_gb >= 24.0) {
+            return 8ULL * 1024 * 1024 * 1024;  // 8GB for medium-high memory systems
+        } else if (available_gb >= 16.0) {
+            return 6ULL * 1024 * 1024 * 1024;  // 6GB for medium-memory systems
+        } else if (available_gb >= 8.0) {
+            return 3ULL * 1024 * 1024 * 1024;  // 3GB for low-memory systems
         } else {
-            // Very high memory system: start with 8GB
-            return 8ull * 1024ull * 1024ull * 1024ull;
+            return 1ULL * 1024 * 1024 * 1024;  // 1GB minimum
         }
     }
     

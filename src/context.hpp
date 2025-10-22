@@ -27,70 +27,71 @@ public:
   }
 
   void *alloc(size_t bytes) {
-    size_t cur = align_up(offset, align_bytes);
-    if (cur + bytes > arena.size()) {
-      // Check if the allocation is too large (>8GB for a single tensor)
-      if (bytes > 8ull * 1024ull * 1024ull * 1024ull) {
-        std::cerr << "[Context] Error: Single tensor allocation too large (" 
-                  << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB). Consider model sharding." << std::endl;
-        throw std::bad_alloc();
-      }
-      
-      // Use very conservative growth strategy to avoid system memory exhaustion
+    if (bytes == 0) return nullptr;
+    
+    // Check for extremely large single tensor allocations (>8GB)
+    if (bytes > 8ULL * 1024 * 1024 * 1024) {
+      std::cerr << "[Context] Error: Single tensor allocation too large ("
+                << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
+      throw std::bad_alloc();
+    }
+    
+    // Align to 64-byte boundary for better performance
+    size_t aligned_bytes = (bytes + 63) & ~63ULL;
+    
+    // Check if we need to resize
+    if (offset + aligned_bytes > arena.size()) {
+      size_t needed_size = offset + aligned_bytes;
       size_t current_size = arena.size();
-      size_t needed_size = cur + bytes;
-      size_t new_size;
       
-      // Check available system memory before attempting allocation
+      // More aggressive growth strategy to reduce frequent reallocations
+      // For large models, grow by at least 2GB or 100% of current size, whichever is larger
+      size_t min_growth_gb = 2ULL * 1024 * 1024 * 1024; // 2GB minimum growth
+      size_t percentage_growth = current_size; // 100% growth
+      size_t growth = std::max({min_growth_gb, percentage_growth, needed_size - current_size});
+      size_t new_size = current_size + growth;
+      
+      // Check available system memory and limit allocation if necessary
       size_t available_memory = get_available_memory();
-      size_t max_safe_allocation = available_memory / 2; // Use at most 50% of available memory
+      size_t max_safe_size = static_cast<size_t>(available_memory * 0.75); // Use 75% of available memory
       
-      if (current_size > 12ull * 1024ull * 1024ull * 1024ull) { // > 12GB
-        // For very large arenas, only grow by exactly what's needed + small buffer
-        new_size = needed_size + 256ull * 1024ull * 1024ull; // +256MB buffer
-      } else if (current_size > 4ull * 1024ull * 1024ull * 1024ull) { // > 4GB
-        // For large arenas, grow conservatively
-        new_size = std::min(needed_size + 1024ull * 1024ull * 1024ull, current_size + current_size / 4);
-      } else {
-        // For smaller arenas, use moderate growth
-        new_size = std::max(current_size + current_size / 2, needed_size);
-      }
-      
-      // Ensure we don't exceed safe memory limits
-      if (new_size > max_safe_allocation) {
-        new_size = std::max(needed_size + 128ull * 1024ull * 1024ull, max_safe_allocation);
-        std::cout << "[Context] Limiting allocation to " << (new_size / (1024.0 * 1024.0 * 1024.0)) 
+      if (new_size > max_safe_size) {
+        // If we can't grow aggressively, try a more conservative approach
+        size_t conservative_growth = std::max(needed_size - current_size, current_size / 4);
+        new_size = std::min(current_size + conservative_growth, max_safe_size);
+        
+        if (new_size < needed_size) {
+          new_size = needed_size; // Must allocate at least what's needed
+        }
+        
+        std::cout << "[Context] Limiting allocation to " << (new_size / (1024.0 * 1024.0 * 1024.0))
                   << " GB due to system memory constraints" << std::endl;
       }
       
       std::cout << "[Context] Resize arena from " << (current_size / (1024.0 * 1024.0 * 1024.0))
-                << " GB to " << (new_size / (1024.0 * 1024.0 * 1024.0)) 
+                << " GB to " << (new_size / (1024.0 * 1024.0 * 1024.0))
                 << " GB (need=" << (needed_size / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
       
       try {
         arena.resize(new_size);
       } catch (const std::bad_alloc& e) {
         std::cerr << "[Context] Failed to resize arena to " << (new_size / (1024.0 * 1024.0 * 1024.0))
-                  << " GB" << std::endl;
+                  << " GB. Trying minimal resize..." << std::endl;
         
-        // Final attempt: allocate exactly what's needed
-        size_t minimal_size = needed_size + 64ull * 1024ull * 1024ull; // +64MB buffer
-        std::cout << "[Context] Final attempt: minimal resize to " 
-                  << (minimal_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
-        
+        // Fallback: try to allocate just what we need
         try {
-          arena.resize(minimal_size);
+          arena.resize(needed_size);
+          std::cout << "[Context] Minimal resize successful: " << (needed_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
         } catch (const std::bad_alloc& e2) {
-          std::cerr << "[Context] Critical: Cannot allocate " 
-                    << (minimal_size / (1024.0 * 1024.0 * 1024.0)) 
-                    << " GB. Available memory: " << (available_memory / (1024.0 * 1024.0 * 1024.0)) 
-                    << " GB" << std::endl;
+          std::cerr << "[Context] Critical: Cannot allocate even minimal memory (" 
+                    << (needed_size / (1024.0 * 1024.0 * 1024.0)) << " GB)" << std::endl;
           throw;
         }
       }
     }
-    void *ptr = arena.data() + cur;
-    offset = cur + bytes;
+    
+    void* ptr = arena.data() + offset;
+    offset += aligned_bytes;
     return ptr;
   }
 

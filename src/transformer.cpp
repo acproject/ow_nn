@@ -695,7 +695,7 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     cache_len = seq_len;
 
     // Compute Q for all tokens and apply MRoPE
-    auto q_all = Tensor::matvec_blocked_mt(hidden_states, q_proj);
+    auto q_all = Tensor::matmul_cache_friendly(hidden_states, q_proj);
     sanitize_tensor(q_all, "q_proj");
     auto q_reshaped = q_all->reshape_view({seq_len, num_heads, head_dim});
     q_reshaped = q_norm->forward(q_reshaped);
@@ -737,7 +737,7 @@ TensorPtr MultiHeadAttention::forward(const TensorPtr& hidden_states, int seq_le
     }
 
     // Output projection
-    auto out = Tensor::matvec_blocked_mt(attn_flat, o_proj);
+    auto out = Tensor::matmul_cache_friendly(attn_flat, o_proj);
     sanitize_tensor(out, "o_proj");
 
     return out;

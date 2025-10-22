@@ -543,6 +543,9 @@ int main(int argc, char **argv) {
       for (int step = 0; step < max_new_tokens; ++step) {
         // Check memory usage before each generation step
         try {
+          // Mark memory state for cleanup after each step
+          auto step_mark = gen_ctx->mark();
+          
           // Create 3D position IDs for MRoPE-Interleave: [3, 1, seq_len] where 3 = [T, H, W]
           // For text-only generation: T = token_position, H = 1, W = 1
           int seq_len = (int)ids.size();
@@ -553,7 +556,15 @@ int main(int argc, char **argv) {
             position_ids->set_from_float_flat(2 * seq_len + i, 1.0f);      // W dimension: width = 1 for text
         }
         
+        // Call model forward
+        std::cout << "[DEBUG] Calling model->forward with ids.size()=" << ids.size() << std::endl;
         auto hidden_states = model->forward(ids, position_ids);
+        std::cout << "[DEBUG] Model forward completed, hidden_states shape: [";
+        for (size_t i = 0; i < hidden_states->shape.size(); ++i) {
+          if (i > 0) std::cout << ", ";
+          std::cout << hidden_states->shape[i];
+        }
+        std::cout << "]" << std::endl;
         
         bool has_nan = false;
         size_t n = hidden_states->nelements();
@@ -573,19 +584,24 @@ int main(int argc, char **argv) {
         auto last_hidden = hidden_states->slice_view({seq_len2 - 1, 0}, {1, hidden_size2});
 
         // Debug: print shapes
-        std::ostringstream debug_ss;
-        debug_ss << "last_hidden shape: [";
+        std::cout << "[DEBUG] hidden_states shape: [";
+        for (size_t i = 0; i < hidden_states->shape.size(); ++i) {
+          if (i > 0) std::cout << ", ";
+          std::cout << hidden_states->shape[i];
+        }
+        std::cout << "]" << std::endl;
+        
+        std::cout << "[DEBUG] last_hidden shape: [";
         for (size_t i = 0; i < last_hidden->shape.size(); ++i) {
-          if (i > 0) debug_ss << ", ";
-          debug_ss << last_hidden->shape[i];
+          if (i > 0) std::cout << ", ";
+          std::cout << last_hidden->shape[i];
         }
-        debug_ss << "], vocab_weight shape: [";
+        std::cout << "], vocab_weight shape: [";
         for (size_t i = 0; i < vocab_weight->shape.size(); ++i) {
-          if (i > 0) debug_ss << ", ";
-          debug_ss << vocab_weight->shape[i];
+          if (i > 0) std::cout << ", ";
+          std::cout << vocab_weight->shape[i];
         }
-        debug_ss << "]";
-        ow::nn::log(ow::nn::LogLevel::INFO, "GEN", debug_ss.str());
+        std::cout << "]" << std::endl;
 
         // using pre-fetched vocab_weight (FLOAT32)
 
@@ -660,7 +676,15 @@ int main(int argc, char **argv) {
           consecutive_empty_tokens = 0;
         }
 
-        if (!piece.empty() && piece.back() == '\n') { break; }
+        if (!piece.empty() && piece.back() == '\n') { 
+          // Clean up step memory before breaking
+          gen_ctx->release_to(step_mark);
+          break; 
+        }
+        
+        // Clean up temporary allocations from this step
+        gen_ctx->release_to(step_mark);
+        
         } catch (const std::bad_alloc &e) {
           ow::nn::log(ow::nn::LogLevel::ERROR, "GEN", "Memory allocation failed during generation step " + std::to_string(step) + ": " + std::string(e.what()));
           std::cerr << "[ERROR] Out of memory at generation step " << step << ". Stopping generation." << std::endl;
