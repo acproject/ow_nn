@@ -128,10 +128,21 @@ class VisionAttention(nn.Module):
                 **kwargs
                 ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        # todo
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-        )
+        # 将输入 hidden_states 通过一次线性变换（self.qkv）得到混合的 Q/K/V 向量，
+        # 其形状为 [seq_length, 3 * num_heads * head_dim]。
+        qkv = self.qkv(hidden_states)                      # [seq_len, 3 * dim]
+        
+        # 把最后一维拆成 3 份，分别对应 Q、K、V；同时把 num_heads 维度显式拆出。
+        # reshape 后形状：[seq_length, 3, num_heads, head_dim]
+        qkv = qkv.reshape(seq_length, 3, self.num_heads, -1)
+        
+        # 调整维度顺序，把“3”放到最前，方便后续用 unbind 直接拆成 q/k/v 三个张量。
+        # permute 后形状：[3, seq_length, num_heads, head_dim]
+        qkv = qkv.permute(1, 0, 2, 3)
+        
+        # 沿第 0 维拆成 3 个张量，依次赋给 query_states、key_states、value_states。
+        # 每个张量形状：[seq_length, num_heads, head_dim]
+        query_states, key_states, value_states = qkv.unbind(0)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 

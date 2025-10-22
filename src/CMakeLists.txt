@@ -2,6 +2,7 @@
 set(SOURCES
     tokenizer.cpp
     transformer.cpp
+    backend_qwen3vl.hpp
     sampler.cpp
     context.hpp
     thread_pool.hpp
