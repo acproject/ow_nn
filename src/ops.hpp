@@ -7,6 +7,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -909,6 +910,125 @@ inline OpNode make_concat_node(const std::vector<std::string> &ins, const std::s
   return n;
 }
 
+// -------------------- Shape ops: unsqueeze / squeeze / permute --------------------
+inline TensorPtr unsqueeze(const TensorPtr &X, int axis) {
+  int r = (int)X->shape.size();
+  int ax = axis < 0 ? r + 1 + axis : axis;
+  if (ax < 0 || ax > r) throw std::runtime_error("unsqueeze: axis out of range");
+  std::vector<int> ns = X->shape;
+  ns.insert(ns.begin() + ax, 1);
+  if (X->is_contiguous_row_major()) return X->reshape_view(ns);
+  return X->copy()->reshape_view(ns);
+}
+
+inline TensorPtr squeeze_axis(const TensorPtr &X, int axis) {
+  int r = (int)X->shape.size();
+  int ax = axis < 0 ? r + axis : axis;
+  if (ax < 0 || ax >= r) throw std::runtime_error("squeeze: axis out of range");
+  if (X->shape[ax] != 1) throw std::runtime_error("squeeze: dimension to squeeze must be 1");
+  std::vector<int> ns; ns.reserve(r - 1);
+  for (int i = 0; i < r; ++i) if (i != ax) ns.push_back(X->shape[i]);
+  if (ns.empty()) ns.push_back(1);
+  if (X->is_contiguous_row_major()) return X->reshape_view(ns);
+  return X->copy()->reshape_view(ns);
+}
+
+inline TensorPtr squeeze_all(const TensorPtr &X) {
+  int r = (int)X->shape.size();
+  std::vector<int> ns; ns.reserve(r);
+  for (int i = 0; i < r; ++i) if (X->shape[i] != 1) ns.push_back(X->shape[i]);
+  if (ns.empty()) ns.push_back(1);
+  if (X->is_contiguous_row_major()) return X->reshape_view(ns);
+  return X->copy()->reshape_view(ns);
+}
+
+inline TensorPtr permute_view(const TensorPtr &X, const std::vector<int> &dims) {
+  int r = (int)X->shape.size();
+  if ((int)dims.size() != r) throw std::runtime_error("permute: dims size must equal rank");
+  std::vector<int> new_shape(r), new_strides(r);
+  std::vector<char> used(r, 0);
+  for (int i = 0; i < r; ++i) {
+    int d = dims[i]; if (d < 0) d += r;
+    if (d < 0 || d >= r) throw std::runtime_error("permute: dim index out of range");
+    if (used[d]) throw std::runtime_error("permute: repeated dim index");
+    used[d] = 1;
+    new_shape[i] = X->shape[d];
+    new_strides[i] = X->strides[d];
+  }
+  return X->view(new_shape, new_strides, 0);
+}
+
+inline OpNode make_unsqueeze_node(const std::string &in, const std::string &out, int axis) {
+  OpNode n; n.name = "unsqueeze"; n.inputs = {in}; n.output = out;
+  n.fn = [axis](const std::vector<TensorPtr> &vs,
+                const std::unordered_map<std::string, std::string> &) {
+    return unsqueeze(vs[0], axis);
+  };
+  n.infer = [axis](const std::vector<TensorDesc> &ids,
+                   const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1) throw std::runtime_error("unsqueeze infer: need 1 input");
+    int r = (int)ids[0].shape.size();
+    int ax = axis < 0 ? r + 1 + axis : axis;
+    if (ax < 0 || ax > r) throw std::runtime_error("unsqueeze infer: axis out of range");
+    auto ns = ids[0].shape; ns.insert(ns.begin() + ax, 1);
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = ns; td.strides = Tensor::calc_strides(ns);
+    return td;
+  }; return n;
+}
+
+inline OpNode make_squeeze_node(const std::string &in, const std::string &out, bool has_axis, int axis_if_any) {
+  OpNode n; n.name = "squeeze"; n.inputs = {in}; n.output = out;
+  n.fn = [has_axis, axis_if_any](const std::vector<TensorPtr> &vs,
+                                 const std::unordered_map<std::string, std::string> &) {
+    if (has_axis) return squeeze_axis(vs[0], axis_if_any);
+    return squeeze_all(vs[0]);
+  };
+  n.infer = [has_axis, axis_if_any](const std::vector<TensorDesc> &ids,
+                                    const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1) throw std::runtime_error("squeeze infer: need 1 input");
+    auto ns = ids[0].shape;
+    if (has_axis) {
+      int r = (int)ns.size(); int ax = axis_if_any < 0 ? r + axis_if_any : axis_if_any;
+      if (ax < 0 || ax >= r) throw std::runtime_error("squeeze infer: axis out of range");
+      if (ns[ax] != 1) throw std::runtime_error("squeeze infer: dim to squeeze must be 1");
+      ns.erase(ns.begin() + ax);
+      if (ns.empty()) ns.push_back(1);
+    } else {
+      std::vector<int> tmp; tmp.reserve(ns.size());
+      for (int d : ns) if (d != 1) tmp.push_back(d);
+      ns.swap(tmp);
+      if (ns.empty()) ns.push_back(1);
+    }
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = ns; td.strides = Tensor::calc_strides(ns);
+    return td;
+  }; return n;
+}
+
+inline OpNode make_permute_node(const std::string &in, const std::string &out, const std::vector<int> &dims) {
+  OpNode n; n.name = "permute"; n.inputs = {in}; n.output = out;
+  n.fn = [dims](const std::vector<TensorPtr> &vs,
+                const std::unordered_map<std::string, std::string> &) {
+    return permute_view(vs[0], dims);
+  };
+  n.infer = [dims](const std::vector<TensorDesc> &ids,
+                   const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1) throw std::runtime_error("permute infer: need 1 input");
+    int r = (int)ids[0].shape.size();
+    if ((int)dims.size() != r) throw std::runtime_error("permute infer: dims size != rank");
+    std::vector<int> ns(r);
+    std::vector<char> used(r, 0);
+    for (int i = 0; i < r; ++i) {
+      int d = dims[i]; if (d < 0) d += r;
+      if (d < 0 || d >= r) throw std::runtime_error("permute infer: dim out of range");
+      if (used[d]) throw std::runtime_error("permute infer: repeated dim");
+      used[d] = 1;
+      ns[i] = ids[0].shape[d];
+    }
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = ns; td.strides = Tensor::calc_strides(ns);
+    return td;
+  }; return n;
+}
+
 // -------------------- Linear / Matmul / Elementwise node factories --------------------
 inline OpNode make_linear_node(const std::string &in,
                                const std::string &weight,
@@ -1126,6 +1246,31 @@ inline void register_standard_ops() {
     int axis = attr_i(attrs, "axis", -1);
     return make_concat_node(ins, out, axis);
   });
+  R.register_factory("unsqueeze", [](const std::vector<std::string> &ins, const std::string &out,
+                                      const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("unsqueeze needs 1 input");
+    int axis = attr_i(attrs, "axis", 0);
+    return make_unsqueeze_node(ins[0], out, axis);
+  });
+  R.register_factory("squeeze", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("squeeze needs 1 input");
+    bool has_axis = attrs.find("axis") != attrs.end();
+    int axis = has_axis ? attr_i(attrs, "axis", 0) : 0;
+    return make_squeeze_node(ins[0], out, has_axis, axis);
+  });
+  R.register_factory("permute", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("permute needs 1 input");
+    auto it = attrs.find("dims");
+    if (it == attrs.end()) throw std::runtime_error("permute: missing 'dims' attribute like '0,2,1'");
+    std::vector<int> dims; dims.reserve(8);
+    std::stringstream ss(it->second); std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (!tok.empty()) dims.push_back(std::stoi(tok));
+    }
+    return make_permute_node(ins[0], out, dims);
+  });
   // residual
   R.register_factory("residual_add", [](const std::vector<std::string> &ins, const std::string &out,
                                          const std::unordered_map<std::string, std::string> &attrs) {
@@ -1229,6 +1374,22 @@ public:
   GraphBuilder &flatten(const std::string &in, const std::string &out, int start_axis = 1, int end_axis = -1) {
     std::unordered_map<std::string, std::string> attrs{{"start_axis", std::to_string(start_axis)}, {"end_axis", std::to_string(end_axis)}};
     return apply("flatten", {in}, out, attrs);
+  }
+  GraphBuilder &unsqueeze(const std::string &in, const std::string &out, int axis) {
+    std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}};
+    return apply("unsqueeze", {in}, out, attrs);
+  }
+  GraphBuilder &squeeze(const std::string &in, const std::string &out, int axis) {
+    std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}};
+    return apply("squeeze", {in}, out, attrs);
+  }
+  GraphBuilder &squeeze_all(const std::string &in, const std::string &out) {
+    return apply("squeeze", {in}, out);
+  }
+  GraphBuilder &permute(const std::string &in, const std::string &out, const std::vector<int> &dims) {
+    std::ostringstream oss; for (size_t i = 0; i < dims.size(); ++i) { if (i) oss << ","; oss << dims[i]; }
+    std::unordered_map<std::string, std::string> attrs{{"dims", oss.str()}};
+    return apply("permute", {in}, out, attrs);
   }
   GraphBuilder &concat(const std::vector<std::string> &ins, const std::string &out, int axis) {
     std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}};

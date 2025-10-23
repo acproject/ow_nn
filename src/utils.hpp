@@ -1,34 +1,84 @@
 #pragma once
 
-#include "tensor.hpp"
 #include "ops.hpp"
+#include "tensor.hpp"
+#include <tuple>
 
 namespace ow::nn {
 // 参考 Python: x1 = x[..., :L/2]; x2 = x[..., L/2:]; cat((-x2, x1), dim=-1)
 static inline TensorPtr rotate_half(const TensorPtr &x) {
-  if (!x) throw std::runtime_error("rotate_half: input is null");
+  if (!x)
+    throw std::runtime_error("rotate_half: input is null");
   int r = (int)x->shape.size();
-  if (r <= 0) throw std::runtime_error("rotate_half: rank must be >= 1");
+  if (r <= 0)
+    throw std::runtime_error("rotate_half: rank must be >= 1");
   int last = r - 1;
   int L = x->shape[last];
-  if (L <= 0) throw std::runtime_error("rotate_half: last dim must be > 0");
-  if ((L % 2) != 0) throw std::runtime_error("rotate_half: last dim must be even");
+  if (L <= 0)
+    throw std::runtime_error("rotate_half: last dim must be > 0");
+  if ((L % 2) != 0)
+    throw std::runtime_error("rotate_half: last dim must be even");
   int half = L / 2;
 
   // x1 = x[..., :half]
   std::vector<int> starts1(r, 0);
-  std::vector<int> lens1 = x->shape; lens1[last] = half;
+  std::vector<int> lens1 = x->shape;
+  lens1[last] = half;
   auto x1 = x->slice_view(starts1, lens1);
 
   // x2 = x[..., half:]
-  std::vector<int> starts2(r, 0); starts2[last] = half;
-  std::vector<int> lens2 = x->shape; lens2[last] = L - half;
+  std::vector<int> starts2(r, 0);
+  starts2[last] = half;
+  std::vector<int> lens2 = x->shape;
+  lens2[last] = L - half;
   auto x2 = x->slice_view(starts2, lens2);
 
   // -x2
-  auto nx2 = x2->elementwise_unary(x2, [](float v){ return -v; });
+  auto nx2 = x2->elementwise_unary(x2, [](float v) { return -v; });
 
   // concat([-x2, x1], dim=-1)
   return concat({nx2, x1}, -1);
+}
+
+/**
+ * @brief 对 query 和 key 张量应用旋转位置编码（RoPE）。
+ *
+ * @param q 查询张量。
+ * @param k 键张量。
+ * @param cos 旋转嵌入的余弦部分。
+ * @param sin 旋转嵌入的正弦部分。
+ * @param position_ids 已弃用且未使用。
+ * @param unsqueeze_dim 指定沿哪个维度对 cos[position_ids] 和 sin[position_ids] 进行 unsqueeze，
+ *                      以便它们能与 q 和 k 的维度正确广播。例如，cos[position_ids] 与 sin[position_ids]
+ *                      形状为 [batch_size, seq_len, head_dim]，若 q 和 k 形状为 
+ *                      [batch_size, heads, seq_len, head_dim]，则设 unsqueeze_dim=1；
+ *                      若 q 和 k 形状为 [batch_size, seq_len, heads, head_dim]，则设 unsqueeze_dim=2。
+ * @return std::tuple<TensorPtr> 包含经过旋转位置编码后的 query 和 key 张量。
+ */
+static inline std::tuple<TensorPtr, TensorPtr>
+apply_rotary_pos_emb(const TensorPtr &q, const TensorPtr &k,
+                     const TensorPtr &cos, const TensorPtr &sin,
+                     const TensorPtr &position_ids, int unsqueeze_dim) {
+  (void)position_ids; // 未使用，但保留签名以兼容上层接口
+  if (!q || !k || !cos || !sin)
+    throw std::runtime_error("apply_rotary_pos_emb: null input");
+
+  // 对 cos/sin 在指定维度 unsqueeze 以便与 q/k 广播
+  auto cos_u = unsqueeze(cos, unsqueeze_dim);
+  auto sin_u = unsqueeze(sin, unsqueeze_dim);
+
+  // q_embed = (q * cos) + (rotate_half(q) * sin)
+  auto q_mul = q->tensor_mul(q, cos_u);
+  auto q_rot = rotate_half(q);
+  auto q_rot_mul = q_rot->tensor_mul(q_rot, sin_u);
+  auto q_embed = q_mul->tensor_add(q_mul, q_rot_mul);
+
+  // k_embed = (k * cos) + (rotate_half(k) * sin)
+  auto k_mul = k->tensor_mul(k, cos_u);
+  auto k_rot = rotate_half(k);
+  auto k_rot_mul = k_rot->tensor_mul(k_rot, sin_u);
+  auto k_embed = k_mul->tensor_add(k_mul, k_rot_mul);
+
+  return std::make_tuple(q_embed, k_embed);
 }
 } // namespace ow::nn
