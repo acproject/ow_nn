@@ -13,6 +13,7 @@ set(SOURCES
     memory_optimizer.hpp
     ops.hpp
     logging.hpp
+    utils.hpp
 )
 
 # 创建静态库

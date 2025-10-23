@@ -542,8 +542,11 @@ ROPE_INIT_FUNCTIONS = {
 }
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    # 将输入张量 x 在最后一个维度上均分为两部分：
+    # x1 取前半部分，x2 取后半部分
+    # 这一步通常用于 RoPE 的 rotate_half 操作，以便后续构造负号交替的旋转分量
+    x1 = x[..., : x.shape[-1] // 2]   # 前半部分
+    x2 = x[..., x.shape[-1] // 2 :]   # 后半部分
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):

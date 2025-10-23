@@ -1,8 +1,11 @@
 #pragma once
 #include "context.hpp"
 #include "tensor.hpp"
+#include "utils.hpp"
+
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -161,7 +164,7 @@ struct Qwen2RMSNorm {
 
 struct LlamaConfig {
   static inline const std::string model_type = "llama";
-  static inline const std::vector<std::string> key_to_ignore_at_inference{
+  static inline const std::vector<std::string> key_to_ignore_at_inference = {
       "past_key_values"};
   static inline const std::unordered_map<std::string, std::string>
       base_model_tp_plan = {
@@ -173,6 +176,62 @@ struct LlamaConfig {
           {"layers.*.mlp.up_proj", "colwise"},
           {"layers.*.mlp.down_proj", "rowwise"},
   };
+  static inline const std::unordered_map<
+      std::string,
+      std::tuple<std::vector<std::string>, std::vector<std::string>>>
+      model_io_map = {
+          {"embed_tokens", {{"input_ids"}, {"inputs_embeds"}}},
+          {"layers", {{"hidden_states", "attention_mask"}, {"hidden_states"}}},
+          {"norm", {{"hidden_states"}, {"hidden_states"}}},
+  };
+
+  LlamaConfig() {
+    vocab_size = 32000;
+    hidden_size = 4096;
+    intermediate_size = 11008;
+    num_hidden_layers = 32;
+    num_attention_heads = 32;
+    num_key_value_heads = std::nullopt;
+    hidden_act = "silu";
+    max_position_embeddings = 2048;
+    initializer_range = 0.02;
+    rms_norm_eps = 1e-6;
+    use_cache = true;
+    pad_token_id = std::nullopt;
+    bos_token_id = 1;
+    eos_token_id = 2;
+    pretraining_tp = 1;
+    tie_word_embeddings = false;
+    rope_parameters = std::nullopt;
+    attention_bias = false;
+    attention_dropout = 0.0;
+    mlp_bias = false;
+    head_dim = std::nullopt;
+  }
+
+  int vocab_size = 32000;
+  int hidden_size = 4096;
+  int intermediate_size = 11008;
+  int num_hidden_layers = 32;
+  int num_attention_heads = 32;
+  std::optional<int> num_key_value_heads;
+  std::string hidden_act = "silu";
+  int max_position_embeddings = 2048;
+  double initializer_range = 0.02;
+  double rms_norm_eps = 1e-6;
+  bool use_cache = true;
+  std::optional<int> pad_token_id;
+  int bos_token_id = 1;
+  int eos_token_id = 2;
+  int pretraining_tp = 1;
+  bool tie_word_embeddings = false;
+  std::optional<std::variant<RopeParameters,
+                             std::unordered_map<std::string, RopeParameters>>>
+      rope_parameters;
+  bool attention_bias = false;
+  double attention_dropout = 0.0;
+  bool mlp_bias = false;
+  std::optional<int> head_dim;
 };
 
 } // namespace ow::nn
