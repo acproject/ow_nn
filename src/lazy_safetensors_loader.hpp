@@ -144,6 +144,11 @@ struct LazyMMapFile {
     return base;
   }
   
+  // For non-Windows, map_file simply ensures data is loaded
+  void map_file() const {
+    (void)get_data();
+  }
+  
   void unmap() const {
     if (loaded) {
       buf.clear();

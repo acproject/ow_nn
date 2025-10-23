@@ -10,6 +10,10 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace ow::nn {
@@ -103,11 +107,30 @@ private:
     memInfo.dwLength = sizeof(MEMORYSTATUSEX);
     GlobalMemoryStatusEx(&memInfo);
     return static_cast<size_t>(memInfo.ullAvailPhys);
+#elif defined(__APPLE__)
+    // macOS: use mach host_statistics64 to get free and inactive pages
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm_stats;
+    kern_return_t kr = host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                         reinterpret_cast<host_info64_t>(&vm_stats),
+                                         &count);
+    if (kr != KERN_SUCCESS) {
+      return 0;
+    }
+    // Get page size via sysctl, fallback to sysconf if needed
+    int page_size = 0;
+    size_t len = sizeof(page_size);
+    int mib[2] = {CTL_HW, HW_PAGESIZE};
+    if (sysctl(mib, 2, &page_size, &len, nullptr, 0) != 0 || page_size <= 0) {
+      page_size = (int)sysconf(_SC_PAGE_SIZE);
+    }
+    uint64_t free_pages = vm_stats.free_count + vm_stats.inactive_count;
+    return static_cast<size_t>(free_pages) * static_cast<size_t>(page_size);
 #else
-    // For Linux/Unix systems
+    // Linux/Unix (non-Apple): use available physical pages
     long pages = sysconf(_SC_AVPHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
-    return static_cast<size_t>(pages * page_size);
+    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
 #endif
   }
 

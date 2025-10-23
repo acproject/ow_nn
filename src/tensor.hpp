@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
@@ -18,7 +19,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstdlib>
 
 // 前缀声明，用于定义下面的智能指针
 namespace ow::nn {
@@ -65,6 +65,8 @@ struct Tensor : public std::enable_shared_from_this<Tensor> {
   }
 
 public:
+  // 计算张量中元素的总个数
+  // 遍历 shape 向量，将所有维度大小相乘得到总元素数
   size_t nelements() const {
     size_t n = 1;
     for (int d : shape)
@@ -101,6 +103,90 @@ public:
     return t;
   }
 
+  // Create tensor filled with ones (torch.ones-like)
+  static TensorPtr ones(const std::shared_ptr<Context> &ctx,
+                        const std::vector<int> &shape,
+                        DType dtype = DType::FLOAT32) {
+    auto t = Tensor::create(ctx, shape, dtype);
+    size_t n = t->nelements();
+    if (dtype == DType::FLOAT32) {
+      float *p = reinterpret_cast<float *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1.0f;
+    } else if (dtype == DType::FP16) {
+      uint16_t *p = reinterpret_cast<uint16_t *>(t->data);
+      uint16_t one = float_to_fp16(1.0f);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = one;
+    } else if (dtype == DType::BF16) {
+      uint16_t *p = reinterpret_cast<uint16_t *>(t->data);
+      uint16_t one = float_to_bf16(1.0f);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = one;
+    } else if (dtype == DType::INT32) {
+      int32_t *p = reinterpret_cast<int32_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::INT8) {
+      int8_t *p = reinterpret_cast<int8_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::U8) {
+      uint8_t *p = reinterpret_cast<uint8_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::BOOL) {
+      uint8_t *p = reinterpret_cast<uint8_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::I16) {
+      int16_t *p = reinterpret_cast<int16_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::I64) {
+      int64_t *p = reinterpret_cast<int64_t *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1;
+    } else if (dtype == DType::F64) {
+      double *p = reinterpret_cast<double *>(t->data);
+      for (size_t i = 0; i < n; ++i)
+        p[i] = 1.0;
+    } else if (dtype == DType::FP8_E4M3) {
+      uint8_t *p = reinterpret_cast<uint8_t *>(t->data);
+      uint8_t one = 0x38; // exp=bias(7), mant=0
+      for (size_t i = 0; i < n; ++i)
+        p[i] = one;
+    } else if (dtype == DType::FP8_E5M2) {
+      uint8_t *p = reinterpret_cast<uint8_t *>(t->data);
+      uint8_t one = 0x3C; // exp=bias(15), mant=0
+      for (size_t i = 0; i < n; ++i)
+        p[i] = one;
+    } else if (dtype == DType::Q4_0) {
+      // Use quantized setter; scale already initialized to 1.0
+      for (size_t i = 0; i < n; ++i)
+        t->set_from_float_flat(i, 1.0f);
+    } else {
+      // Fallback: try generic setter
+      for (size_t i = 0; i < n; ++i)
+        t->set_from_float_flat(i, 1.0f);
+    }
+    return t;
+  }
+
+  // Convenience: create ones with same shape and optional dtype override
+  static TensorPtr ones_like(const TensorPtr &other, DType dtype) {
+    auto ctx = other->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+    return Tensor::ones(ctx, other->shape, dtype);
+  }
+  static TensorPtr ones_like(const TensorPtr &other) {
+    auto ctx = other->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+    return Tensor::ones(ctx, other->shape, other->dtype);
+  }
+
   bool is_contiguous_row_major() const {
     return strides == calc_strides(shape);
   }
@@ -112,26 +198,31 @@ public:
     if (new_ne != nelements()) {
       std::cerr << "[Tensor] reshape_view size mismatch: old_shape=[";
       for (size_t i = 0; i < shape.size(); ++i) {
-        if (i) std::cerr << ",";
+        if (i)
+          std::cerr << ",";
         std::cerr << shape[i];
       }
       std::cerr << "] ne=" << nelements() << " new_shape=[";
       for (size_t i = 0; i < new_shape.size(); ++i) {
-        if (i) std::cerr << ",";
+        if (i)
+          std::cerr << ",";
         std::cerr << new_shape[i];
       }
       std::cerr << "] new_ne=" << new_ne << std::endl;
       throw std::runtime_error("reshape size mismatch");
     }
     if (!is_contiguous_row_major()) {
-      std::cerr << "[Tensor] reshape_view requires contiguous tensor: old_shape=[";
+      std::cerr
+          << "[Tensor] reshape_view requires contiguous tensor: old_shape=[";
       for (size_t i = 0; i < shape.size(); ++i) {
-        if (i) std::cerr << ",";
+        if (i)
+          std::cerr << ",";
         std::cerr << shape[i];
       }
       std::cerr << "] strides=[";
       for (size_t i = 0; i < strides.size(); ++i) {
-        if (i) std::cerr << ",";
+        if (i)
+          std::cerr << ",";
         std::cerr << strides[i];
       }
       std::cerr << "]" << std::endl;
@@ -198,7 +289,8 @@ public:
   // 创建一个复制副本（保持 dtype 与布局），数据拷贝
   TensorPtr copy() const {
     auto c = ctx.lock();
-    if (!c) throw std::runtime_error("ctx expired");
+    if (!c)
+      throw std::runtime_error("ctx expired");
     auto out = Tensor::create(c, shape, dtype);
     std::memcpy(out->data, data, nbytes());
     return out;
@@ -206,9 +298,11 @@ public:
 
   // 转换 dtype，逐元素转换
   TensorPtr astype(DType new_dtype) const {
-    if (new_dtype == dtype) return copy();
+    if (new_dtype == dtype)
+      return copy();
     auto c = ctx.lock();
-    if (!c) throw std::runtime_error("ctx expired");
+    if (!c)
+      throw std::runtime_error("ctx expired");
     auto out = Tensor::create(c, shape, new_dtype);
     size_t n = nelements();
     for (size_t i = 0; i < n; ++i) {
@@ -252,13 +346,16 @@ public:
     uint8_t mant = x & 0x07;
     const int bias = 7;
     if (exp == 0) {
-      if (mant == 0) return sign ? -0.0f : 0.0f;
+      if (mant == 0)
+        return sign ? -0.0f : 0.0f;
       float m = mant / 8.0f;
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x0F) {
       // Inf / NaN
-      if (mant == 0) return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+      if (mant == 0)
+        return sign ? -std::numeric_limits<float>::infinity()
+                    : std::numeric_limits<float>::infinity();
       return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 8.0f;
@@ -267,19 +364,23 @@ public:
       return sign ? -val : val;
     }
   }
+
   static inline float fp8_e5m2_to_f32(uint8_t x) {
     uint8_t sign = (x >> 7) & 0x1;
     uint8_t exp = (x >> 2) & 0x1F;
     uint8_t mant = x & 0x03;
     const int bias = 15;
     if (exp == 0) {
-      if (mant == 0) return sign ? -0.0f : 0.0f;
+      if (mant == 0)
+        return sign ? -0.0f : 0.0f;
       float m = mant / 4.0f;
       float val = std::ldexp(m, 1 - bias);
       return sign ? -val : val;
     } else if (exp == 0x1F) {
       // Inf / NaN
-      if (mant == 0) return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+      if (mant == 0)
+        return sign ? -std::numeric_limits<float>::infinity()
+                    : std::numeric_limits<float>::infinity();
       return std::numeric_limits<float>::quiet_NaN();
     } else {
       float m = 1.0f + mant / 4.0f;
@@ -351,27 +452,33 @@ public:
     return 0.0f;
   }
 
+  // 将单个 float 值写入张量第 index 个元素，按当前 dtype 做类型转换/量化
   void set_from_float_flat(size_t index, float v) {
+    // FLOAT32：直接写入
     if (dtype == DType::FLOAT32) {
       float *p = reinterpret_cast<float *>(data);
       p[index] = v;
       return;
     }
+    // FP16：先转 FP16 再写入
     if (dtype == DType::FP16) {
       uint16_t *p = reinterpret_cast<uint16_t *>(data);
       p[index] = float_to_fp16(v);
       return;
     }
+    // BF16：先转 BF16 再写入
     if (dtype == DType::BF16) {
       uint16_t *p = reinterpret_cast<uint16_t *>(data);
       p[index] = float_to_bf16(v);
       return;
     }
+    // INT32：直接强转后写入
     if (dtype == DType::INT32) {
       int32_t *p = reinterpret_cast<int32_t *>(data);
       p[index] = float(v);
       return;
     }
+    // INT8：四舍五入并饱和到 [-128,127]
     if (dtype == DType::INT8) {
       int8_t *p = reinterpret_cast<int8_t *>(data);
       int32_t vv = (int32_t)std::round(v);
@@ -382,29 +489,30 @@ public:
       p[index] = (int8_t)vv;
       return;
     }
+    // Q4_0：先量化到 [-8,7]，再按 4bit 打包进字节
     if (dtype == DType::Q4_0) {
       uint8_t *p = reinterpret_cast<uint8_t *>(data);
-      int32_t q = (int32_t)std::round(v / qparams.scale);
+      int32_t q = (int32_t)std::round(v / qparams.scale); // 量化
       if (q > 7)
         q = 7;
       if (q < -8)
         q = -8;
-      uint8_t uq = (uint8_t)(q & 0xF);
-      size_t byte_idx = index / 2;
-      bool high = (index % 2) == 0;
+      uint8_t uq = (uint8_t)(q & 0xF); // 保留低 4bit
+      size_t byte_idx = index / 2;     // 每字节存 2 个 4bit
+      bool high = (index % 2) == 0;    // 高 4bit 还是低 4bit
       uint8_t old = p[byte_idx];
       if (high)
-        old = (old & 0x0F) | (uq << 4);
+        old = (old & 0x0F) | (uq << 4); // 写高 4bit
       else
-        old = (old & 0xF0) | (uq & 0x0F);
+        old = (old & 0xF0) | (uq & 0x0F); // 写低 4bit
       p[byte_idx] = old;
       return;
     }
   }
 
   // ----------------------- broadcasting helpers -----------------------
-  static std::vector<int> broadcast_shape(const std::vector<int>& a,
-                                          const std::vector<int>& b) {
+  static std::vector<int> broadcast_shape(const std::vector<int> &a,
+                                          const std::vector<int> &b) {
     size_t ra = a.size(), rb = b.size();
     size_t r = std::max(ra, rb);
     std::vector<int> out(r, 1);
@@ -418,19 +526,20 @@ public:
     return out;
   }
 
-  static size_t linear_index(const std::vector<int>& shape,
-                             const std::vector<int>& idx) {
+  static size_t linear_index(const std::vector<int> &shape,
+                             const std::vector<int> &idx) {
     size_t r = shape.size();
     size_t off = 0;
-    for (size_t i = 0; i < r; ++i) off = off * (size_t)shape[i] + (size_t)idx[i];
+    for (size_t i = 0; i < r; ++i)
+      off = off * (size_t)shape[i] + (size_t)idx[i];
     return off;
   }
 
-  static void next_index(std::vector<int>& idx,
-                         const std::vector<int>& shape) {
+  static void next_index(std::vector<int> &idx, const std::vector<int> &shape) {
     for (int i = (int)shape.size() - 1; i >= 0; --i) {
       idx[i]++;
-      if (idx[i] < shape[i]) return;
+      if (idx[i] < shape[i])
+        return;
       idx[i] = 0;
     }
   }
@@ -487,10 +596,12 @@ public:
 #endif
   // SIMD pack helper: pack B panel [p0,p1) x [j0,j1) into contiguous buffer
   // Uses scratch buffer for better memory efficiency
-  static inline float* ow_pack_B_panel_scratch(const TensorPtr &B, int j0, int j1, int p0,
-                                               int p1, int W, const std::shared_ptr<Context>& ctx) {
+  static inline float *
+  ow_pack_B_panel_scratch(const TensorPtr &B, int j0, int j1, int p0, int p1,
+                          int W, const std::shared_ptr<Context> &ctx) {
     int k_len = p1 - p0;
-    float* pack = static_cast<float*>(ctx->scratch_alloc_matrix_pack(k_len, W));
+    float *pack =
+        static_cast<float *>(ctx->scratch_alloc_matrix_pack(k_len, W));
     int n = B->shape[1];
     for (int p = 0; p < k_len; ++p) {
       int src_p = p0 + p;
@@ -500,9 +611,12 @@ public:
         if (j < j1) {
           size_t bi = (size_t)src_p * n + j;
           bv = B->get_as_float_flat(bi);
-          if (!std::isfinite(bv)) bv = 0.0f;
-          else if (bv > 1e6f) bv = 1e6f;
-          else if (bv < -1e6f) bv = -1e6f;
+          if (!std::isfinite(bv))
+            bv = 0.0f;
+          else if (bv > 1e6f)
+            bv = 1e6f;
+          else if (bv < -1e6f)
+            bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
@@ -524,32 +638,42 @@ public:
         if (j < j1) {
           size_t bi = (size_t)src_p * n + j;
           bv = B->get_as_float_flat(bi);
-          if (!std::isfinite(bv)) bv = 0.0f;
-          else if (bv > 1e6f) bv = 1e6f;
-          else if (bv < -1e6f) bv = -1e6f;
+          if (!std::isfinite(bv))
+            bv = 0.0f;
+          else if (bv > 1e6f)
+            bv = 1e6f;
+          else if (bv < -1e6f)
+            bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
     }
   }
 
-  // Transposed pack helper with scratch buffer: treat B with shape [n, k] as B^T when packing
-  static inline float* ow_pack_B_panel_transposed_scratch(const TensorPtr &B, int j0, int j1, int p0,
-                                                          int p1, int W, const std::shared_ptr<Context>& ctx) {
+  // Transposed pack helper with scratch buffer: treat B with shape [n, k] as
+  // B^T when packing
+  static inline float *
+  ow_pack_B_panel_transposed_scratch(const TensorPtr &B, int j0, int j1, int p0,
+                                     int p1, int W,
+                                     const std::shared_ptr<Context> &ctx) {
     int k_len = p1 - p0;
-    float* pack = static_cast<float*>(ctx->scratch_alloc_matrix_pack(k_len, W));
+    float *pack =
+        static_cast<float *>(ctx->scratch_alloc_matrix_pack(k_len, W));
     int k = B->shape[1];
     for (int p = 0; p < k_len; ++p) {
       int src_p = p0 + p; // along original k dimension
       for (int l = 0; l < W; ++l) {
-        int j = j0 + l;   // along original n dimension
+        int j = j0 + l; // along original n dimension
         float bv = 0.0f;
         if (j < j1) {
           size_t bi = (size_t)j * k + src_p; // index [j, src_p]
           bv = B->get_as_float_flat(bi);
-          if (!std::isfinite(bv)) bv = 0.0f;
-          else if (bv > 1e6f) bv = 1e6f;
-          else if (bv < -1e6f) bv = -1e6f;
+          if (!std::isfinite(bv))
+            bv = 0.0f;
+          else if (bv > 1e6f)
+            bv = 1e6f;
+          else if (bv < -1e6f)
+            bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
@@ -557,23 +681,28 @@ public:
     return pack;
   }
 
-  // Legacy transposed pack helper: treat B with shape [n, k] as B^T when packing
-  static inline void ow_pack_B_panel_transposed(const TensorPtr &B, int j0, int j1, int p0,
-                                     int p1, int W, std::vector<float> &pack) {
+  // Legacy transposed pack helper: treat B with shape [n, k] as B^T when
+  // packing
+  static inline void ow_pack_B_panel_transposed(const TensorPtr &B, int j0,
+                                                int j1, int p0, int p1, int W,
+                                                std::vector<float> &pack) {
     int k_len = p1 - p0;
     pack.resize(k_len * W);
     int k = B->shape[1];
     for (int p = 0; p < k_len; ++p) {
       int src_p = p0 + p; // along original k dimension
       for (int l = 0; l < W; ++l) {
-        int j = j0 + l;   // along original n dimension
+        int j = j0 + l; // along original n dimension
         float bv = 0.0f;
         if (j < j1) {
           size_t bi = (size_t)j * k + src_p; // index [j, src_p]
           bv = B->get_as_float_flat(bi);
-          if (!std::isfinite(bv)) bv = 0.0f;
-          else if (bv > 1e6f) bv = 1e6f;
-          else if (bv < -1e6f) bv = -1e6f;
+          if (!std::isfinite(bv))
+            bv = 0.0f;
+          else if (bv > 1e6f)
+            bv = 1e6f;
+          else if (bv < -1e6f)
+            bv = -1e6f;
         }
         pack[p * W + l] = bv;
       }
@@ -588,25 +717,25 @@ public:
     __m256 acc = _mm256_setzero_ps();
     __m256 clamp_max = _mm256_set1_ps(1e6f);
     __m256 clamp_min = _mm256_set1_ps(-1e6f);
-    
+
     for (int p = 0; p < k_len; ++p) {
       __m256 b = _mm256_loadu_ps(packB + p * 8);
       __m256 a = _mm256_set1_ps(Arow_p0[p]);
-      
+
       // Clamp inputs to prevent overflow
       a = _mm256_max_ps(_mm256_min_ps(a, clamp_max), clamp_min);
       b = _mm256_max_ps(_mm256_min_ps(b, clamp_max), clamp_min);
-      
+
 #if defined(__FMA__)
       acc = _mm256_fmadd_ps(a, b, acc);
 #else
       acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
 #endif
-      
+
       // Clamp accumulator to prevent overflow
       acc = _mm256_max_ps(_mm256_min_ps(acc, clamp_max), clamp_min);
     }
-    
+
     __m256 prev = _mm256_loadu_ps(Rptr);
     prev = _mm256_add_ps(prev, acc);
     // Final clamp before storing
@@ -623,21 +752,21 @@ public:
     __m128 acc = _mm_setzero_ps();
     __m128 clamp_max = _mm_set1_ps(1e6f);
     __m128 clamp_min = _mm_set1_ps(-1e6f);
-    
+
     for (int p = 0; p < k_len; ++p) {
       __m128 b = _mm_loadu_ps(packB + p * stride);
       __m128 a = _mm_set1_ps(Arow_p0[p]);
-      
+
       // Clamp inputs to prevent overflow
       a = _mm_max_ps(_mm_min_ps(a, clamp_max), clamp_min);
       b = _mm_max_ps(_mm_min_ps(b, clamp_max), clamp_min);
-      
+
       acc = _mm_add_ps(acc, _mm_mul_ps(a, b));
-      
+
       // Clamp accumulator to prevent overflow
       acc = _mm_max_ps(_mm_min_ps(acc, clamp_max), clamp_min);
     }
-    
+
     __m128 prev = _mm_loadu_ps(Rptr);
     prev = _mm_add_ps(prev, acc);
     // Final clamp before storing
@@ -669,35 +798,37 @@ public:
     // L1: 32KB, L2: 256KB, L3: 8MB (typical values)
     size_t L1_size = 32 * 1024;
     size_t L2_size = 256 * 1024;
-    
+
     // Calculate optimal block sizes for cache efficiency
-    // For small matrices, use smaller blocks; for large matrices, use larger blocks
+    // For small matrices, use smaller blocks; for large matrices, use larger
+    // blocks
     size_t block_k, block_m, block_n;
-    
+
     if (k <= 64 && m <= 64 && n <= 64) {
-        // Very small matrices - use minimal blocking
-        block_k = std::min(k, 32);
-        block_m = std::min(m, 32);
-        block_n = std::min(n, 32);
+      // Very small matrices - use minimal blocking
+      block_k = std::min(k, 32);
+      block_m = std::min(m, 32);
+      block_n = std::min(n, 32);
     } else if (k <= 512 && m <= 512 && n <= 512) {
-        // Medium matrices - moderate blocking
-        block_k = std::min(k, 64);
-        block_m = std::min(m, 64);
-        block_n = std::min(n, 64);
+      // Medium matrices - moderate blocking
+      block_k = std::min(k, 64);
+      block_m = std::min(m, 64);
+      block_n = std::min(n, 64);
     } else {
-        // Large matrices - aggressive blocking for cache efficiency
-        block_k = std::min(k, 128);
-        block_m = std::min(m, 128);
-        block_n = std::min(n, 128);
+      // Large matrices - aggressive blocking for cache efficiency
+      block_k = std::min(k, 128);
+      block_m = std::min(m, 128);
+      block_n = std::min(n, 128);
     }
-    
+
     // Ensure minimum block sizes for SIMD efficiency
     block_m = std::max(block_m, (size_t)8);
     block_n = std::max(block_n, (size_t)8);
     block_k = std::max(block_k, (size_t)8);
-    
-    if (const char* vv = std::getenv("OWNN_VERBOSE_MATMUL"); vv && vv[0] != '0') {
-      std::cout << "[MatMul] Cache-friendly blocks: M=" << block_m 
+
+    if (const char *vv = std::getenv("OWNN_VERBOSE_MATMUL");
+        vv && vv[0] != '0') {
+      std::cout << "[MatMul] Cache-friendly blocks: M=" << block_m
                 << ", N=" << block_n << ", K=" << block_k << std::endl;
     }
 
@@ -712,7 +843,8 @@ public:
 #endif
 
     const bool fastA = (A->dtype == DType::FLOAT32);
-    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
+    const float *Adata =
+        fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
     float *Rdata = reinterpret_cast<float *>(R->data);
 
     std::vector<std::future<void>> futs;
@@ -721,8 +853,9 @@ public:
       futs.emplace_back(tp.submit([=, &A, &B, &R]() {
         // Reset scratch buffer at the start of each thread task
         auto ctx = A->ctx.lock();
-        if (ctx) ctx->scratch_reset();
-        
+        if (ctx)
+          ctx->scratch_reset();
+
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
           int j1 = (std::min)(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
@@ -730,11 +863,12 @@ public:
             for (int jpanel = j0; jpanel < j1; jpanel += W) {
               int jend = (std::min)(j1, jpanel + W);
               // Use scratch buffer for better memory efficiency
-              float* pack;
+              float *pack;
               if (B_is_k_by_n) {
                 pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
               } else {
-                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
+                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0,
+                                                          p1, W, ctx);
               }
               int k_len = p1 - p0;
               for (int ii = i0; ii < i1; ++ii) {
@@ -755,12 +889,15 @@ public:
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
                 float acc_buf[8];
-                for (int l = 0; l < width; ++l) acc_buf[l] = 0.0f;
-                
+                for (int l = 0; l < width; ++l)
+                  acc_buf[l] = 0.0f;
+
                 for (int p = 0; p < k_len; ++p) {
-                  float a = fastA ? Arow[p]
-                                  : A->get_as_float_flat((size_t)ii * k + p0 + p);
-                  if (!std::isfinite(a)) a = 0.0f;
+                  float a = fastA
+                                ? Arow[p]
+                                : A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  if (!std::isfinite(a))
+                    a = 0.0f;
                   const float *bvec = pack + p * W;
                   for (int l = 0; l < width; ++l) {
                     acc_buf[l] += a * bvec[l];
@@ -773,7 +910,8 @@ public:
                 }
               }
               // Release scratch used by this panel to avoid accumulation
-              if (ctx) ctx->scratch_reset();
+              if (ctx)
+                ctx->scratch_reset();
             }
           }
         }
@@ -824,7 +962,8 @@ public:
       futs.emplace_back(tp.submit([=, &A, &B, &R]() {
         // Reset scratch buffer at the start of each thread task
         auto ctx = A->ctx.lock();
-        if (ctx) ctx->scratch_reset();
+        if (ctx)
+          ctx->scratch_reset();
         for (int j0 = 0; j0 < n; j0 += (int)block_n) {
           int j1 = (std::min)(n, j0 + (int)block_n);
           for (int p0 = 0; p0 < k; p0 += (int)block_k) {
@@ -832,11 +971,12 @@ public:
             for (int jpanel = j0; jpanel < j1; jpanel += W) {
               int jend = (std::min)(j1, jpanel + W);
               // Use scratch buffer instead of vector allocation
-              float* pack;
+              float *pack;
               if (B_is_k_by_n) {
                 pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
               } else {
-                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
+                pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0,
+                                                          p1, W, ctx);
               }
               int k_len = p1 - p0;
               for (int ii = i0; ii < i1; ++ii) {
@@ -857,12 +997,15 @@ public:
                 // fallback scalar for leftover columns or non-FLOAT32 A
                 int width = jend - jpanel;
                 float acc_buf[8];
-                for (int l = 0; l < width; ++l) acc_buf[l] = 0.0f;
-                
+                for (int l = 0; l < width; ++l)
+                  acc_buf[l] = 0.0f;
+
                 for (int p = 0; p < k_len; ++p) {
-                  float a = fastA ? Arow[p]
-                                  : A->get_as_float_flat((size_t)ii * k + p0 + p);
-                  if (!std::isfinite(a)) a = 0.0f;
+                  float a = fastA
+                                ? Arow[p]
+                                : A->get_as_float_flat((size_t)ii * k + p0 + p);
+                  if (!std::isfinite(a))
+                    a = 0.0f;
                   const float *bvec = pack + p * W;
                   for (int l = 0; l < width; ++l) {
                     acc_buf[l] += a * bvec[l];
@@ -875,7 +1018,8 @@ public:
                 }
               }
               // Release scratch used by this panel to avoid accumulation
-              if (ctx) ctx->scratch_reset();
+              if (ctx)
+                ctx->scratch_reset();
             }
           }
         }
@@ -886,25 +1030,57 @@ public:
     return R;
   }
 
+  // Linear: Y = X * W + bias(optional)
+  // - X: [m, k]
+  // - W: [k, n] or [n, k] (both accepted)
+  // - Returns: [m, n] (FLOAT32)
+  static TensorPtr linear(const TensorPtr &X, const TensorPtr &W) {
+    return matmul_cache_friendly(X, W);
+  }
+
+  // Linear with bias: bias supports shapes [n], [1, n], or [m, n]
+  static TensorPtr linear(const TensorPtr &X, const TensorPtr &W, const TensorPtr &bias) {
+    auto Y = matmul_cache_friendly(X, W);
+    if (!bias) return Y;
+    int m = Y->shape[0];
+    int n = Y->shape[1];
+    // Validate bias dims roughly match output features
+    if (bias->shape.size() == 1) {
+      if (bias->shape[0] != n)
+        throw std::runtime_error("linear: bias shape must be [n]");
+    } else if (bias->shape.size() == 2) {
+      int bm = bias->shape[0];
+      int bn = bias->shape[1];
+      if (!(bn == n && (bm == 1 || bm == m)))
+        throw std::runtime_error("linear: bias must be [1,n] or [m,n]");
+    } else {
+      throw std::runtime_error("linear: bias rank must be 1 or 2");
+    }
+    // Broadcasting add
+    return Y->tensor_add(Y, bias);
+  }
+
   // 专用 1xK · KxN 的并行 matvec（按列块并行），用于 LMHead 大词表场景
   // A: [1, K], B: [K, N] -> R: [1, N]
   static TensorPtr matvec_blocked_mt(const TensorPtr &A, const TensorPtr &B,
-                                     size_t block_n = 4096,
-                                     size_t block_k = 64,
+                                     size_t block_n = 4096, size_t block_k = 64,
                                      size_t nthreads = 0) {
     if (A->shape.size() != 2 || B->shape.size() != 2)
       throw std::runtime_error("matvec: need 2D");
     int m = A->shape[0];
     int k = A->shape[1];
-    if (m != 1) throw std::runtime_error("matvec expects A as [1,K]");
+    if (m != 1)
+      throw std::runtime_error("matvec expects A as [1,K]");
 
     bool B_is_k_by_n = (B->shape[0] == k);
     bool B_is_n_by_k = (B->shape[1] == k);
-    if (!B_is_k_by_n && !B_is_n_by_k) throw std::runtime_error("matvec dim");
+    if (!B_is_k_by_n && !B_is_n_by_k)
+      throw std::runtime_error("matvec dim");
     int n = B_is_k_by_n ? B->shape[1] : B->shape[0];
 
     auto ctx = A->ctx.lock();
-    if (!ctx) throw std::runtime_error("ctx expired");
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
     auto R = Tensor::create(ctx, {1, n}, DType::FLOAT32);
 
     if (nthreads == 0)
@@ -918,11 +1094,13 @@ public:
 #endif
 
     const bool fastA = (A->dtype == DType::FLOAT32);
-    const float *Adata = fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
+    const float *Adata =
+        fastA ? reinterpret_cast<const float *>(A->data) : nullptr;
     float *Rdata = reinterpret_cast<float *>(R->data);
 
     // 初始化为 0（微核会做累加）
-    for (int j = 0; j < n; ++j) Rdata[j] = 0.0f;
+    for (int j = 0; j < n; ++j)
+      Rdata[j] = 0.0f;
 
     std::vector<std::future<void>> futs;
     for (int j0 = 0; j0 < n; j0 += (int)block_n) {
@@ -930,8 +1108,9 @@ public:
       futs.emplace_back(tp.submit([=, &A, &B]() {
         // Reset scratch buffer at the start of each thread task
         auto ctx = A->ctx.lock();
-        if (ctx) ctx->scratch_reset();
-        
+        if (ctx)
+          ctx->scratch_reset();
+
         for (int p0 = 0; p0 < k; p0 += (int)block_k) {
           int p1 = (std::min)(k, p0 + (int)block_k);
           const float *Arow_p0 = fastA ? (Adata + p0) : nullptr;
@@ -939,18 +1118,20 @@ public:
           for (int jpanel = j0; jpanel < j1; jpanel += W) {
             int jend = (std::min)(j1, jpanel + W);
             // Use scratch buffer instead of vector allocation
-            float* pack;
+            float *pack;
             if (B_is_k_by_n) {
               pack = ow_pack_B_panel_scratch(B, jpanel, jend, p0, p1, W, ctx);
             } else {
-              pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1, W, ctx);
+              pack = ow_pack_B_panel_transposed_scratch(B, jpanel, jend, p0, p1,
+                                                        W, ctx);
             }
             float *Rptr = Rdata + jpanel;
 #if defined(__AVX__)
             if (jend - jpanel == 8 && Arow_p0) {
               ow_microkernel_row_8_avx(Arow_p0, pack, k_len, Rptr);
               // Release scratch per panel
-              if (ctx) ctx->scratch_reset();
+              if (ctx)
+                ctx->scratch_reset();
               continue;
             }
 #endif
@@ -958,7 +1139,8 @@ public:
             if (jend - jpanel == 4 && Arow_p0) {
               ow_microkernel_row_4_sse(Arow_p0, pack, k_len, Rptr, W);
               // Release scratch per panel
-              if (ctx) ctx->scratch_reset();
+              if (ctx)
+                ctx->scratch_reset();
               continue;
             }
 #endif
@@ -966,19 +1148,22 @@ public:
             int width = jend - jpanel;
             for (int p = 0; p < k_len; ++p) {
               float a = fastA ? Arow_p0[p] : A->get_as_float_flat(p0 + p);
-              if (!std::isfinite(a)) a = 0.0f;
+              if (!std::isfinite(a))
+                a = 0.0f;
               const float *bvec = pack + p * W;
               for (int l = 0; l < width; ++l) {
                 Rptr[l] += a * bvec[l];
               }
             }
             // Release scratch per panel
-            if (ctx) ctx->scratch_reset();
+            if (ctx)
+              ctx->scratch_reset();
           }
         }
       }));
     }
-    for (auto &f : futs) f.get();
+    for (auto &f : futs)
+      f.get();
     return R;
   }
 
@@ -988,11 +1173,14 @@ public:
                                const std::function<float(float, float)> &op) {
     // 支持广播规则（尾维对齐，维度为1可扩展）
     auto ctx = A->ctx.lock();
-    if (!ctx) throw std::runtime_error("ctx expired");
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
     auto out_shape = broadcast_shape(A->shape, B->shape);
     auto R = Tensor::create(ctx, out_shape, DType::FLOAT32);
     std::vector<int> idx(out_shape.size(), 0);
-    size_t total = 1; for (int d: out_shape) total *= (size_t)d;
+    size_t total = 1;
+    for (int d : out_shape)
+      total *= (size_t)d;
     for (size_t t = 0; t < total; ++t) {
       // map output idx to A/B idx
       std::vector<int> ia(A->shape.size(), 0), ib(B->shape.size(), 0);
@@ -1035,7 +1223,8 @@ public:
   TensorPtr elementwise_unary(const TensorPtr &A,
                               const std::function<float(float)> &op) {
     auto ctx = A->ctx.lock();
-    if (!ctx) throw std::runtime_error("ctx expired");
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
     auto R = Tensor::create(ctx, A->shape, DType::FLOAT32);
     size_t n = A->nelements();
     for (size_t i = 0; i < n; ++i) {
@@ -1048,8 +1237,8 @@ public:
   // Specialized Conv3d for Qwen-VL patch embedding
   // in_channels=3 -> out_channels=1280
   // kernel=(2,14,14), stride=(2,14,14), bias=False
-  // Input X shape: {C=3, D, H, W}; Weight W: {Cout=1280, Cin=3, Kd=2, Kh=14, Kw=14}
-  // Output: {Cout, D_out=D/2, H_out=H/14, W_out=W/14}
+  // Input X shape: {C=3, D, H, W}; Weight W: {Cout=1280, Cin=3, Kd=2, Kh=14,
+  // Kw=14} Output: {Cout, D_out=D/2, H_out=H/14, W_out=W/14}
   static TensorPtr conv3d_k21414_s21414(const TensorPtr &X,
                                         const TensorPtr &W) {
     if (!X || !W)
@@ -1092,10 +1281,12 @@ public:
               for (int kd = 0; kd < Kd; ++kd) {
                 for (int kh = 0; kh < Kh; ++kh) {
                   for (int kw = 0; kw < Kw; ++kw) {
-                    size_t xi = (size_t)((((c * D) + (d0 + kd)) * H +
-                                          (h0 + kh)) * Ww + (w0 + kw));
-                    size_t wi = (size_t)(((((oc * Cin) + c) * Kd + kd) * Kh +
-                                          kh) * Kw + kw);
+                    size_t xi =
+                        (size_t)((((c * D) + (d0 + kd)) * H + (h0 + kh)) * Ww +
+                                 (w0 + kw));
+                    size_t wi =
+                        (size_t)(((((oc * Cin) + c) * Kd + kd) * Kh + kh) * Kw +
+                                 kw);
                     float xv = X->get_as_float_flat(xi);
                     float wv = W->get_as_float_flat(wi);
                     acc += (double)xv * (double)wv;

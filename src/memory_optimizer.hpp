@@ -14,6 +14,10 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace ow::nn {
@@ -27,10 +31,29 @@ public:
         memInfo.dwLength = sizeof(MEMORYSTATUSEX);
         GlobalMemoryStatusEx(&memInfo);
         return memInfo.ullAvailPhys / (1024.0 * 1024.0 * 1024.0);
+#elif defined(__APPLE__)
+        // macOS: use host_statistics64 to get free + inactive pages
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        vm_statistics64_data_t vm_stats;
+        kern_return_t kr = host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                             reinterpret_cast<host_info64_t>(&vm_stats),
+                                             &count);
+        if (kr != KERN_SUCCESS) {
+            return 0.0;
+        }
+        int page_size = 0; size_t len = sizeof(page_size);
+        int mib[2] = {CTL_HW, HW_PAGESIZE};
+        if (sysctl(mib, 2, &page_size, &len, nullptr, 0) != 0 || page_size <= 0) {
+            page_size = (int)sysconf(_SC_PAGE_SIZE);
+        }
+        uint64_t free_pages = vm_stats.free_count + vm_stats.inactive_count;
+        double bytes = (double)free_pages * (double)page_size;
+        return bytes / (1024.0 * 1024.0 * 1024.0);
 #else
         long pages = sysconf(_SC_AVPHYS_PAGES);
         long page_size = sysconf(_SC_PAGE_SIZE);
-        return (pages * page_size) / (1024.0 * 1024.0 * 1024.0);
+        double bytes = (double)pages * (double)page_size;
+        return bytes / (1024.0 * 1024.0 * 1024.0);
 #endif
     }
     

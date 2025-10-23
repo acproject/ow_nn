@@ -909,4 +909,354 @@ inline OpNode make_concat_node(const std::vector<std::string> &ins, const std::s
   return n;
 }
 
+// -------------------- Linear / Matmul / Elementwise node factories --------------------
+inline OpNode make_linear_node(const std::string &in,
+                               const std::string &weight,
+                               const std::string &out,
+                               const std::string &bias_optional = "") {
+  OpNode n; n.name = "linear";
+  n.inputs = bias_optional.empty() ? std::vector<std::string>{in, weight}
+                                   : std::vector<std::string>{in, weight, bias_optional};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    const TensorPtr &X = ins[0]; const TensorPtr &W = ins[1];
+    const TensorPtr bias = (ins.size() >= 3) ? ins[2] : nullptr;
+    if (bias) return Tensor::linear(X, W, bias);
+    return Tensor::linear(X, W);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("linear infer: need X and W");
+    auto Xd = ids[0]; auto Wd = ids[1];
+    if ((int)Xd.shape.size() != 2 || (int)Wd.shape.size() != 2)
+      throw std::runtime_error("linear infer: X/W rank 2");
+    int m = Xd.shape[0]; int kx = Xd.shape[1];
+    int kw = Wd.shape[0]; int nw = Wd.shape[1];
+    int n;
+    // 支持 W 为 [k,n] 或 [n,k]（与 PyTorch 权重相兼容）
+    if (kw == kx) {
+      n = nw; // W: [k,n]
+    } else if (nw == kx) {
+      n = kw; // W: [n,k]
+    } else {
+      throw std::runtime_error("linear infer: K mismatch between X and W");
+    }
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = {m, n}; td.strides = Tensor::calc_strides(td.shape);
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_matmul_node(const std::string &a, const std::string &b, const std::string &out) {
+  OpNode n; n.name = "matmul"; n.inputs = {a, b}; n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    return Tensor::matmul_cache_friendly(ins[0], ins[1]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("matmul infer: need A and B");
+    auto Ad = ids[0]; auto Bd = ids[1];
+    if ((int)Ad.shape.size() != 2 || (int)Bd.shape.size() != 2)
+      throw std::runtime_error("matmul infer: A/B rank 2");
+    int m = Ad.shape[0]; int kA = Ad.shape[1];
+    int kB = Bd.shape[0]; int n = Bd.shape[1];
+    if (kA != kB) throw std::runtime_error("matmul infer: K mismatch");
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = {m, n}; td.strides = Tensor::calc_strides(td.shape);
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_add_node(const std::string &a, const std::string &b, const std::string &out) {
+  OpNode n; n.name = "add"; n.inputs = {a, b}; n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    return Tensor::tensor_add(ins[0], ins[1]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("add infer: need A and B");
+    auto s = Tensor::broadcast_shape(ids[0].shape, ids[1].shape);
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = s; td.strides = Tensor::calc_strides(s);
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_sub_node(const std::string &a, const std::string &b, const std::string &out) {
+  OpNode n; n.name = "sub"; n.inputs = {a, b}; n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    return Tensor::tensor_sub(ins[0], ins[1]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("sub infer: need A and B");
+    auto s = Tensor::broadcast_shape(ids[0].shape, ids[1].shape);
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = s; td.strides = Tensor::calc_strides(s);
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_mul_node(const std::string &a, const std::string &b, const std::string &out) {
+  OpNode n; n.name = "mul"; n.inputs = {a, b}; n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    return Tensor::tensor_mul(ins[0], ins[1]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() < 2) throw std::runtime_error("mul infer: need A and B");
+    auto s = Tensor::broadcast_shape(ids[0].shape, ids[1].shape);
+    TensorDesc td; td.dtype = DType::FLOAT32; td.shape = s; td.strides = Tensor::calc_strides(s);
+    return td;
+  };
+  return n;
+}
+
+// -------------------- NodeRegistry & register_standard_ops --------------------
+using NodeFactory = std::function<OpNode(const std::vector<std::string> &,
+                                         const std::string &,
+                                         const std::unordered_map<std::string, std::string> &)>;
+
+struct NodeRegistry {
+  std::unordered_map<std::string, NodeFactory> factories;
+  static NodeRegistry &instance() { static NodeRegistry inst; return inst; }
+  void register_factory(const std::string &op, const NodeFactory &f) { factories[op] = f; }
+  bool has(const std::string &op) const { return factories.find(op) != factories.end(); }
+  OpNode make(const std::string &op,
+              const std::vector<std::string> &ins,
+              const std::string &out,
+              const std::unordered_map<std::string, std::string> &attrs = {}) {
+    auto it = factories.find(op);
+    if (it == factories.end()) throw std::runtime_error(std::string("NodeRegistry: unknown op '") + op + "'");
+    return it->second(ins, out, attrs);
+  }
+};
+
+inline void register_standard_ops() {
+  static bool inited = false; if (inited) return; inited = true;
+  auto &R = NodeRegistry::instance();
+  // unary activations
+  R.register_factory("relu", [](const std::vector<std::string> &ins, const std::string &out,
+                                const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 1) throw std::runtime_error("relu needs 1 input");
+    return make_relu_node(ins[0], out);
+  });
+  R.register_factory("sigmoid", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 1) throw std::runtime_error("sigmoid needs 1 input");
+    return make_sigmoid_node(ins[0], out);
+  });
+  R.register_factory("tanh", [](const std::vector<std::string> &ins, const std::string &out,
+                                 const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 1) throw std::runtime_error("tanh needs 1 input");
+    return make_tanh_node(ins[0], out);
+  });
+  R.register_factory("gelu", [](const std::vector<std::string> &ins, const std::string &out,
+                                 const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("gelu needs 1 input");
+    bool approx = attr_b(attrs, "approximate", true);
+    return make_gelu_node(ins[0], out, approx);
+  });
+  R.register_factory("softmax", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("softmax needs 1 input");
+    int axis = attr_i(attrs, "axis", -1);
+    return make_softmax_node(ins[0], out, axis);
+  });
+  // linear & matmul & elementwise
+  R.register_factory("linear", [](const std::vector<std::string> &ins, const std::string &out,
+                                   const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() < 2 || ins.size() > 3) throw std::runtime_error("linear needs 2 or 3 inputs");
+    return make_linear_node(ins[0], ins[1], out, ins.size() == 3 ? ins[2] : "");
+  });
+  R.register_factory("matmul", [](const std::vector<std::string> &ins, const std::string &out,
+                                   const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 2) throw std::runtime_error("matmul needs 2 inputs");
+    return make_matmul_node(ins[0], ins[1], out);
+  });
+  R.register_factory("add", [](const std::vector<std::string> &ins, const std::string &out,
+                                const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 2) throw std::runtime_error("add needs 2 inputs");
+    return make_add_node(ins[0], ins[1], out);
+  });
+  R.register_factory("sub", [](const std::vector<std::string> &ins, const std::string &out,
+                                const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 2) throw std::runtime_error("sub needs 2 inputs");
+    return make_sub_node(ins[0], ins[1], out);
+  });
+  R.register_factory("mul", [](const std::vector<std::string> &ins, const std::string &out,
+                                const std::unordered_map<std::string, std::string> &) {
+    if (ins.size() != 2) throw std::runtime_error("mul needs 2 inputs");
+    return make_mul_node(ins[0], ins[1], out);
+  });
+  // norm & conv & pooling & reshape & concat
+  R.register_factory("batch_norm", [](const std::vector<std::string> &ins, const std::string &out,
+                                       const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 5) throw std::runtime_error("batch_norm needs 5 inputs");
+    return make_batch_norm_node(ins[0], ins[1], ins[2], ins[3], ins[4], out);
+  });
+  R.register_factory("layer_norm", [](const std::vector<std::string> &ins, const std::string &out,
+                                       const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 3) throw std::runtime_error("layer_norm needs 3 inputs");
+    int axis = attr_i(attrs, "axis", -1);
+    return make_layer_norm_node(ins[0], ins[1], ins[2], out, axis);
+  });
+  R.register_factory("conv2d", [](const std::vector<std::string> &ins, const std::string &out,
+                                   const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() < 2 || ins.size() > 3) throw std::runtime_error("conv2d needs 2 or 3 inputs");
+    return make_conv2d_node(ins[0], ins[1], out, ins.size() == 3 ? ins[2] : "");
+  });
+  R.register_factory("avg_pool2d", [](const std::vector<std::string> &ins, const std::string &out,
+                                       const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("avg_pool2d needs 1 input");
+    return make_avg_pool2d_node(ins[0], out);
+  });
+  R.register_factory("flatten", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("flatten needs 1 input");
+    return make_flatten_node(ins[0], out);
+  });
+  R.register_factory("concat", [](const std::vector<std::string> &ins, const std::string &out,
+                                   const std::unordered_map<std::string, std::string> &attrs) {
+    int axis = attr_i(attrs, "axis", -1);
+    return make_concat_node(ins, out, axis);
+  });
+  // residual
+  R.register_factory("residual_add", [](const std::vector<std::string> &ins, const std::string &out,
+                                         const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 2) throw std::runtime_error("residual_add needs 2 inputs");
+    OpNode n; n.name = "residual_add"; n.inputs = ins; n.output = out;
+    n.fn = [attrs](const std::vector<TensorPtr> &vs,
+                   const std::unordered_map<std::string, std::string> &) {
+      float alpha = attr_f(attrs, "alpha", 1.0f);
+      return residual_add(vs[0], vs[1], alpha);
+    };
+    n.infer = [](const std::vector<TensorDesc> &ids,
+                 const std::unordered_map<std::string, std::string> &) {
+      auto td = ids[0]; td.dtype = DType::FLOAT32; return td;
+    };
+    return n;
+  });
+  // dropout
+  R.register_factory("dropout", [](const std::vector<std::string> &ins, const std::string &out,
+                                    const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("dropout needs 1 input");
+    OpNode n; n.name = "dropout"; n.inputs = ins; n.output = out;
+    n.fn = [attrs](const std::vector<TensorPtr> &vs,
+                   const std::unordered_map<std::string, std::string> &) {
+      float p = attr_f(attrs, "p", 0.0f);
+      bool training = attr_b(attrs, "training", false);
+      unsigned int seed = (unsigned int)attr_i(attrs, "seed", 42);
+      return dropout(vs[0], p, training, seed);
+    };
+    n.infer = [](const std::vector<TensorDesc> &ids,
+                 const std::unordered_map<std::string, std::string> &) {
+      auto td = ids[0]; td.dtype = DType::FLOAT32; return td;
+    };
+    return n;
+  });
+}
+
+// -------------------- 简易 GraphBuilder --------------------
+class GraphBuilder {
+  ComputeGraph &g;
+public:
+  explicit GraphBuilder(ComputeGraph &graph) : g(graph) { register_standard_ops(); }
+  GraphBuilder &input(const std::string &name, const TensorPtr &t) { g.add_input(name, t); return *this; }
+  GraphBuilder &apply(const std::string &op,
+                      const std::vector<std::string> &ins,
+                      const std::string &out,
+                      const std::unordered_map<std::string, std::string> &attrs = {}) {
+    OpNode n = NodeRegistry::instance().make(op, ins, out, attrs);
+    g.add_node(n);
+    return *this;
+  }
+  // 便捷方法
+  GraphBuilder &linear(const std::string &x, const std::string &w, const std::string &y,
+                       const std::string &b = "") {
+    return apply("linear", b.empty() ? std::vector<std::string>{x, w}
+                                      : std::vector<std::string>{x, w, b}, y);
+  }
+  GraphBuilder &matmul(const std::string &a, const std::string &b, const std::string &y) {
+    return apply("matmul", {a, b}, y);
+  }
+  GraphBuilder &add(const std::string &a, const std::string &b, const std::string &y) {
+    return apply("add", {a, b}, y);
+  }
+  GraphBuilder &sub(const std::string &a, const std::string &b, const std::string &y) {
+    return apply("sub", {a, b}, y);
+  }
+  GraphBuilder &mul(const std::string &a, const std::string &b, const std::string &y) {
+    return apply("mul", {a, b}, y);
+  }
+  GraphBuilder &relu(const std::string &in, const std::string &out) { return apply("relu", {in}, out); }
+  GraphBuilder &sigmoid(const std::string &in, const std::string &out) { return apply("sigmoid", {in}, out); }
+  GraphBuilder &tanh(const std::string &in, const std::string &out) { return apply("tanh", {in}, out); }
+  GraphBuilder &gelu(const std::string &in, const std::string &out, bool approximate = true) {
+    return apply("gelu", {in}, out, std::unordered_map<std::string, std::string>{{"approximate", approximate ? "1" : "0"}});
+  }
+  GraphBuilder &softmax(const std::string &in, const std::string &out, int axis = -1) {
+    return apply("softmax", {in}, out, std::unordered_map<std::string, std::string>{{"axis", std::to_string(axis)}});
+  }
+  GraphBuilder &layer_norm(const std::string &x, const std::string &g, const std::string &b,
+                           const std::string &y, int axis = -1, float eps = 1e-5f) {
+    std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}, {"eps", std::to_string(eps)}};
+    return apply("layer_norm", {x, g, b}, y, attrs);
+  }
+  GraphBuilder &batch_norm(const std::string &x, const std::string &g, const std::string &b,
+                           const std::string &mean, const std::string &var, const std::string &y, float eps = 1e-5f) {
+    std::unordered_map<std::string, std::string> attrs{{"eps", std::to_string(eps)}};
+    return apply("batch_norm", {x, g, b, mean, var}, y, attrs);
+  }
+  GraphBuilder &conv2d(const std::string &x, const std::string &w, const std::string &y,
+                       const std::string &bias = "",
+                       int sh = 1, int sw = 1, int ph = 0, int pw = 0,
+                       int dh = 1, int dw = 1, int groups = 1) {
+    std::unordered_map<std::string, std::string> attrs{
+      {"stride_h", std::to_string(sh)}, {"stride_w", std::to_string(sw)},
+      {"pad_h", std::to_string(ph)}, {"pad_w", std::to_string(pw)},
+      {"dilation_h", std::to_string(dh)}, {"dilation_w", std::to_string(dw)},
+      {"groups", std::to_string(groups)}
+    };
+    return apply("conv2d", bias.empty() ? std::vector<std::string>{x, w}
+                                          : std::vector<std::string>{x, w, bias}, y, attrs);
+  }
+  GraphBuilder &flatten(const std::string &in, const std::string &out, int start_axis = 1, int end_axis = -1) {
+    std::unordered_map<std::string, std::string> attrs{{"start_axis", std::to_string(start_axis)}, {"end_axis", std::to_string(end_axis)}};
+    return apply("flatten", {in}, out, attrs);
+  }
+  GraphBuilder &concat(const std::vector<std::string> &ins, const std::string &out, int axis) {
+    std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}};
+    return apply("concat", ins, out, attrs);
+  }
+  GraphBuilder &avg_pool2d(const std::string &in, const std::string &out,
+                           int kh = 2, int kw = 2, int sh = 2, int sw = 2,
+                           int ph = 0, int pw = 0, int dh = 1, int dw = 1) {
+    std::unordered_map<std::string, std::string> attrs{
+      {"kernel_h", std::to_string(kh)}, {"kernel_w", std::to_string(kw)},
+      {"stride_h", std::to_string(sh)}, {"stride_w", std::to_string(sw)},
+      {"pad_h", std::to_string(ph)}, {"pad_w", std::to_string(pw)},
+      {"dilation_h", std::to_string(dh)}, {"dilation_w", std::to_string(dw)}
+    };
+    return apply("avg_pool2d", {in}, out, attrs);
+  }
+  GraphBuilder &residual_add(const std::string &a, const std::string &b, const std::string &out, float alpha = 1.0f) {
+    std::unordered_map<std::string, std::string> attrs{{"alpha", std::to_string(alpha)}};
+    return apply("residual_add", {a, b}, out, attrs);
+  }
+  GraphBuilder &dropout(const std::string &in, const std::string &out, float p, bool training = false, unsigned int seed = 42) {
+    std::unordered_map<std::string, std::string> attrs{
+      {"p", std::to_string(p)}, {"training", training ? "1" : "0"}, {"seed", std::to_string(seed)}
+    };
+    return apply("dropout", {in}, out, attrs);
+  }
+  // 运行前校验
+  void validate_and_run() { g.validate(); g.run(); }
+};
+
 } // namespace ow::nn

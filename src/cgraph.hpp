@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 namespace ow::nn {
 struct OpNode {
@@ -54,7 +55,7 @@ struct ComputeGraph {
   // parallel
   void run() {
     // build dependency counts
-    std::unordered_map<std::string, int> need_count;
+    std::vector<int> need_count(nodes.size(), 0);
     std::unordered_map<std::string, std::vector<int>> consumers;
     for (size_t i = 0; i < nodes.size(); ++i) {
       for (auto &in : nodes[i].inputs) {
@@ -67,7 +68,7 @@ struct ComputeGraph {
           ++unmet;
         }
       }
-      need_count[nodes[i].name] = unmet;
+      need_count[i] = unmet;
     }
     ThreadPool tp(std::max<size_t>(1, std::thread::hardware_concurrency()));
     std::queue<int> q;
@@ -79,7 +80,7 @@ struct ComputeGraph {
     std::mutex err_m;
     // initially push nodes with all deps satisfied (包括已有输入)
     for (size_t i = 0; i < nodes.size(); ++i) {
-      if (need_count[nodes[i].name] == 0)
+      if (need_count[i] == 0)
         q.push((int)i);
     }
     // lambda to schedule node
@@ -117,7 +118,7 @@ struct ComputeGraph {
               auto it = consumers.find(outname);
               if (it != consumers.end()) {
                 for (int cidx : it->second) {
-                  int rem = --need_count[nodes[cidx].name];
+                  int rem = --need_count[cidx];
                   if (rem == 0) {
                     // push to queue
                     std::unique_lock<std::mutex> lk(mq);
@@ -154,6 +155,54 @@ struct ComputeGraph {
     }
     if (failed) {
       throw std::runtime_error(err_msg);
+    }
+  }
+
+  // 验证图结构：检查上下文、输出重名、缺失输入以及潜在环
+  void validate() {
+    if (!ctx) throw std::runtime_error("ComputeGraph: ctx is null");
+    // 输出名必须非空且唯一；节点必须具备可运行函数
+    std::unordered_set<std::string> outputs;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].output.empty())
+        throw std::runtime_error("validate: node output name empty");
+      if (outputs.count(nodes[i].output))
+        throw std::runtime_error(std::string("validate: duplicate output '") + nodes[i].output + "'");
+      outputs.insert(nodes[i].output);
+      if (!nodes[i].fn)
+        throw std::runtime_error(std::string("validate: node '") + nodes[i].name + "' has no fn");
+    }
+    // Kahn 算法：以现有输入为可用集合，逐步解析依赖，若无法遍历完所有节点则存在环或缺失输入
+    std::unordered_set<std::string> available;
+    for (auto &kv : tensors) available.insert(kv.first);
+    std::unordered_map<std::string, std::vector<int>> consumers;
+    std::vector<int> indeg(nodes.size(), 0);
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      int unmet = 0;
+      for (auto &in : nodes[i].inputs) {
+        consumers[in].push_back((int)i);
+        if (!available.count(in)) ++unmet;
+      }
+      indeg[i] = unmet;
+    }
+    std::queue<int> q;
+    for (size_t i = 0; i < nodes.size(); ++i)
+      if (indeg[i] == 0) q.push((int)i);
+    int visited = 0;
+    while (!q.empty()) {
+      int u = q.front(); q.pop();
+      ++visited;
+      available.insert(nodes[u].output);
+      auto it = consumers.find(nodes[u].output);
+      if (it != consumers.end()) {
+        for (int v : it->second) {
+          int rem = --indeg[v];
+          if (rem == 0) q.push(v);
+        }
+      }
+    }
+    if (visited != (int)nodes.size()) {
+      throw std::runtime_error("validate: graph has cycles or missing inputs; unresolved nodes count=" + std::to_string(nodes.size() - visited));
     }
   }
 };
