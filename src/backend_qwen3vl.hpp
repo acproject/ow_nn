@@ -3,6 +3,7 @@
 #include "tensor.hpp"
 #include "utils.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 #include <string>
@@ -316,6 +317,205 @@ struct LlamaRotaryEmbedding {
     inv_freq = res.first;
     attention_scaling = res.second;
     original_inv_freq = inv_freq; // mirror python semantics
+  }
+};
+
+struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
+  std::vector<int> mrope_section;
+
+  static inline LlamaConfig to_llama_config(const Qwen3VLTextConfig &cfg) {
+    LlamaConfig lc;
+    lc.vocab_size = cfg.vocab_size;
+    lc.hidden_size = cfg.hidden_size;
+    lc.intermediate_size = cfg.intermediate_size;
+    lc.num_hidden_layers = cfg.num_hidden_layers;
+    lc.num_attention_heads = cfg.num_attention_heads;
+    lc.num_key_value_heads = cfg.num_key_value_heads;
+    lc.hidden_act = cfg.hidden_act;
+    lc.max_position_embeddings = cfg.max_position_embeddings;
+    lc.initializer_range = cfg.initializer_range;
+    lc.rms_norm_eps = cfg.rms_norm_eps;
+    lc.use_cache = cfg.use_cache;
+    lc.tie_word_embeddings = cfg.tie_word_embedding;
+    lc.rope_parameters = cfg.rope_parameters;
+    lc.attention_bias = cfg.attention_bias;
+    lc.attention_dropout = cfg.attention_dropout;
+    lc.head_dim = cfg.head_dim;
+    return lc;
+  }
+
+  Qwen3VLTextRotaryEmbedding(const std::shared_ptr<Context> &ctx,
+                             const Qwen3VLTextConfig &config)
+      : LlamaRotaryEmbedding(ctx, to_llama_config(config)) {
+    mrope_section = {24, 20, 20};
+  }
+
+  TensorPtr
+  apply_interleaved_mrope(const TensorPtr &freqs,
+                          const std::vector<int> &mrope_section) const {
+    auto ctx = freqs->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("apply_interleaved_mrope: ctx expired");
+
+    if (freqs->shape.size() != 4 || freqs->shape[0] != 3)
+      throw std::runtime_error(
+          "apply_interleaved_mrope: freqs must be [3,b,seq,dim/2]");
+
+    int batch = freqs->shape[1];
+    int seq_len = freqs->shape[2];
+    int half_dim = freqs->shape[3];
+
+    if (mrope_section.size() != 3)
+      throw std::runtime_error("mrope_section must have 3 elements [t,h,w]");
+
+    int t_section = mrope_section[0];
+    int h_section = mrope_section[1];
+    int w_section = mrope_section[2];
+
+    if (t_section + h_section + w_section != half_dim)
+      throw std::runtime_error("Sum of mrope_section must equal dim/2");
+
+    auto output =
+        Tensor::create(ctx, {batch, seq_len, half_dim}, DType::FLOAT32);
+
+    for (int b = 0; b < batch; ++b) {
+      for (int pos = 0; pos < seq_len; ++pos) {
+        int out_idx = 0;
+        int min_section = std::min({t_section, h_section, w_section});
+
+        for (int i = 0; i < min_section; ++i) {
+          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
+                            (size_t)pos * (size_t)half_dim;
+
+          size_t t_off =
+              (size_t)0 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float t_freq = freqs->get_as_float_flat(t_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), t_freq);
+
+          size_t h_off =
+              (size_t)1 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float h_freq = freqs->get_as_float_flat(h_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), h_freq);
+
+          size_t w_off =
+              (size_t)2 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float w_freq = freqs->get_as_float_flat(w_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), w_freq);
+        }
+
+        for (int i = min_section; i < t_section; ++i) {
+          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
+                            (size_t)pos * (size_t)half_dim;
+          size_t t_off =
+              (size_t)0 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float t_freq = freqs->get_as_float_flat(t_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), t_freq);
+        }
+        for (int i = min_section; i < h_section; ++i) {
+          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
+                            (size_t)pos * (size_t)half_dim;
+          size_t h_off =
+              (size_t)1 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float h_freq = freqs->get_as_float_flat(h_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), h_freq);
+        }
+        for (int i = min_section; i < w_section; ++i) {
+          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
+                            (size_t)pos * (size_t)half_dim;
+          size_t w_off =
+              (size_t)2 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
+              (size_t)b * (size_t)seq_len * (size_t)half_dim +
+              (size_t)pos * (size_t)half_dim + (size_t)i;
+          float w_freq = freqs->get_as_float_flat(w_off);
+          output->set_from_float_flat(base_out + (size_t)(out_idx++), w_freq);
+        }
+      }
+    }
+
+    return output;
+  }
+
+  std::pair<TensorPtr, TensorPtr> forward(const TensorPtr &x,
+                                          const TensorPtr &position_ids) const {
+    if (!x || !position_ids)
+      throw std::runtime_error(
+          "Qwen3VLTextRotaryEmbedding::forward: null input");
+
+    auto ctx = get_ctx_or_throw(x);
+
+    TensorPtr pos3;
+    if (position_ids->shape.size() == 2) {
+      int B = position_ids->shape[0];
+      int S = position_ids->shape[1];
+      pos3 = Tensor::create(ctx, {3, B, S}, DType::FLOAT32);
+      for (int b = 0; b < B; ++b) {
+        for (int s = 0; s < S; ++s) {
+          float v = position_ids->get_as_float_flat((size_t)b * (size_t)S +
+                                                    (size_t)s);
+          pos3->set_from_float_flat((size_t)0 * (size_t)B * (size_t)S +
+                                        (size_t)b * (size_t)S + (size_t)s,
+                                    v);
+          pos3->set_from_float_flat((size_t)1 * (size_t)B * (size_t)S +
+                                        (size_t)b * (size_t)S + (size_t)s,
+                                    v);
+          pos3->set_from_float_flat((size_t)2 * (size_t)B * (size_t)S +
+                                        (size_t)b * (size_t)S + (size_t)s,
+                                    v);
+        }
+      }
+    } else if (position_ids->shape.size() == 3 && position_ids->shape[0] == 3) {
+      pos3 = position_ids;
+    } else {
+      throw std::runtime_error("Qwen3VLTextRotaryEmbedding::forward: "
+                               "position_ids must be [B,S] or [3,B,S]");
+    }
+
+    int B = pos3->shape[1];
+    int S = pos3->shape[2];
+    int half_dim = (int)inv_freq->shape[0];
+
+    auto freqs = Tensor::create(ctx, {3, B, S, half_dim}, DType::FLOAT32);
+    for (int dim_idx = 0; dim_idx < 3; ++dim_idx) {
+      for (int b = 0; b < B; ++b) {
+        for (int s = 0; s < S; ++s) {
+          float p =
+              pos3->get_as_float_flat((size_t)dim_idx * (size_t)B * (size_t)S +
+                                      (size_t)b * (size_t)S + (size_t)s);
+          for (int i = 0; i < half_dim; ++i) {
+            float iv = inv_freq->get_as_float_flat((size_t)i);
+            float v = iv * p;
+            size_t off =
+                (size_t)dim_idx * (size_t)B * (size_t)S * (size_t)half_dim +
+                (size_t)b * (size_t)S * (size_t)half_dim +
+                (size_t)s * (size_t)half_dim + (size_t)i;
+            freqs->set_from_float_flat(off, v);
+          }
+        }
+      }
+    }
+
+    auto freqs_t = apply_interleaved_mrope(freqs, mrope_section);
+
+    auto emb = concat({freqs_t, freqs_t}, -1);
+
+    auto cos = emb->elementwise_unary(emb, [this](float vv) {
+      return std::cos(vv) * this->attention_scaling;
+    });
+    auto sin = emb->elementwise_unary(emb, [this](float vv) {
+      return std::sin(vv) * this->attention_scaling;
+    });
+
+    return {cos, sin};
   }
 };
 

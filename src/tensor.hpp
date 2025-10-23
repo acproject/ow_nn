@@ -1234,6 +1234,16 @@ public:
     return R;
   }
 
+  // 便捷：元素级余弦
+  TensorPtr tensor_cos(const TensorPtr &A) {
+    return elementwise_unary(A, [](float a) { return std::cos(a); });
+  }
+
+  // 便捷：元素级正弦
+  TensorPtr tensor_sin(const TensorPtr &A) {
+    return elementwise_unary(A, [](float a) { return std::sin(a); });
+  }
+
   // Specialized Conv3d for Qwen-VL patch embedding
   // in_channels=3 -> out_channels=1280
   // kernel=(2,14,14), stride=(2,14,14), bias=False
