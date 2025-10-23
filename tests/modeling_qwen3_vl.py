@@ -640,11 +640,22 @@ class Qwen3VLTextRotaryEmbedding(LlamaRotaryEmbedding):
                 returns:
                     x_t: (bs, seq_len, head_dim // 2)
         """
-        freqs_t = freqs[0] # just overwrite the first dimension T
-        for dim , offset in enumerate((1, 2), start=1): # H, W
+        # 将时间维度（T）的频率张量作为基础模板，后续会在其对应切片上覆盖空间维度（H、W）的频率值
+        freqs_t = freqs[0]  # shape: (..., num_positions)，仅保留时间维度的频率信息
+
+        # 遍历空间维度：dim=1 对应高度 H，dim=2 对应宽度 W
+        # offset 从 1 开始，确保与 mrope_section 的索引对齐
+        for dim, offset in enumerate((1, 2), start=1):
+            # 计算当前空间维度在拼接后张量中的总长度（每个维度重复 3 次：T/H/W）
             length = mrope_section[dim] * 3
+            # 构造切片对象：从 offset 开始，每隔 3 个元素取一次，直到 length
+            # 这样可精准定位到当前空间维度在拼接张量中的位置
             idx = slice(offset, length, 3)
+            # 用对应空间维度的频率值覆盖 freqs_t 的对应切片
+            # 实现多维度 RoPE 频率的“交错拼接”效果
             freqs_t[..., idx] = freqs[dim, ..., idx]
+
+        # 返回已完成 T/H/W 频率交错的最终频率张量，供后续 rope 计算使用
         return freqs_t
 
     @torch.no_grad()
