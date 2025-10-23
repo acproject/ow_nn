@@ -3,6 +3,7 @@
 #include "tensor.hpp"
 #include "utils.hpp"
 
+#include <cmath>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -232,6 +233,90 @@ struct LlamaConfig {
   double attention_dropout = 0.0;
   bool mlp_bias = false;
   std::optional<int> head_dim;
+};
+
+struct LlamaRotaryEmbedding {
+  int max_seq_len_cached = 0;
+  int original_max_seq_len = 0;
+  std::string rope_type = "default";
+  float attention_scaling = 1.0f;
+  TensorPtr inv_freq;
+  TensorPtr original_inv_freq;
+
+  static inline std::pair<TensorPtr, float>
+  compute_default_rope_parameters(const LlamaConfig &config,
+                                  const std::shared_ptr<Context> &ctx) {
+    if (!ctx)
+      throw std::runtime_error("LlamaRotaryEmbedding: ctx expired");
+
+    float base = 10000.0f;
+    // Try to get rope theta from config.rope_parameters
+    if (config.rope_parameters.has_value()) {
+      const auto &var = config.rope_parameters.value();
+      if (std::holds_alternative<RopeParameters>(var)) {
+        const auto &rp = std::get<RopeParameters>(var);
+        base = rp.rope_theta;
+      } else {
+        const auto &mp =
+            std::get<std::unordered_map<std::string, RopeParameters>>(var);
+        if (!mp.empty()) {
+          const auto &rp = mp.begin()->second; // pick the first as default
+          base = rp.rope_theta;
+        }
+      }
+    }
+
+    int dim = config.head_dim.has_value()
+                  ? config.head_dim.value()
+                  : (config.hidden_size / config.num_attention_heads);
+    if (dim <= 0)
+      throw std::runtime_error("LlamaRotaryEmbedding: invalid head dim");
+    if ((dim % 2) != 0)
+      throw std::runtime_error(
+          "LlamaRotaryEmbedding: head dim must be even for RoPE");
+
+    auto inv = Tensor::create(ctx, {dim / 2}, DType::FLOAT32);
+    for (int i = 0; i < dim / 2; ++i) {
+      float exponent = (2.0f * (float)i) / (float)dim;
+      float val = 1.0f / std::pow(base, exponent);
+      inv->set_from_float_flat((size_t)i, val);
+    }
+    float attention_factor = 1.0f; // Unused for default RoPE
+    return {inv, attention_factor};
+  }
+
+  LlamaRotaryEmbedding(const std::shared_ptr<Context> &ctx,
+                       const LlamaConfig &config) {
+    if (!ctx)
+      throw std::runtime_error("LlamaRotaryEmbedding: ctx expired");
+
+    max_seq_len_cached = config.max_position_embeddings;
+    original_max_seq_len = config.max_position_embeddings;
+
+    // rope_type selection (fallback to default if not provided)
+    if (config.rope_parameters.has_value()) {
+      const auto &var = config.rope_parameters.value();
+      if (std::holds_alternative<RopeParameters>(var)) {
+        const auto &rp = std::get<RopeParameters>(var);
+        if (rp.rope_type.has_value())
+          rope_type = rp.rope_type.value();
+      } else {
+        const auto &mp =
+            std::get<std::unordered_map<std::string, RopeParameters>>(var);
+        if (!mp.empty()) {
+          const auto &rp = mp.begin()->second;
+          if (rp.rope_type.has_value())
+            rope_type = rp.rope_type.value();
+        }
+      }
+    }
+
+    // Currently only default is implemented; others fallback to default
+    auto res = compute_default_rope_parameters(config, ctx);
+    inv_freq = res.first;
+    attention_scaling = res.second;
+    original_inv_freq = inv_freq; // mirror python semantics
+  }
 };
 
 } // namespace ow::nn
