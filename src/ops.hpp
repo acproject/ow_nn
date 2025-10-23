@@ -883,6 +883,102 @@ inline TensorPtr concat(const std::vector<TensorPtr> &inputs, int axis) {
   return Y;
 }
 
+inline TensorPtr slice(const TensorPtr &X, int axis, int start, int length, int step = 1) {
+  if (!X) throw std::runtime_error("slice: null input");
+  auto ctx = get_ctx_or_throw(X);
+  int r = (int)X->shape.size();
+  int ax = axis < 0 ? r + axis : axis;
+  if (ax < 0 || ax >= r) throw std::runtime_error("slice: axis out of range");
+  if (!X->is_contiguous_row_major()) throw std::runtime_error("slice requires contiguous input");
+  int size_d = X->shape[ax];
+  int s = start;
+  if (s < 0) s += size_d;
+  if (s < 0 || s >= size_d) throw std::runtime_error("slice: start out of range");
+  int len = (length < 0) ? (size_d - s) : length;
+  if (len <= 0 || s + len > size_d) throw std::runtime_error("slice: length out of range");
+  if (step <= 0) throw std::runtime_error("slice: step must be positive");
+  int out_len = (step == 1) ? len : (len + step - 1) / step;
+  std::vector<int> out_shape = X->shape;
+  out_shape[ax] = out_len;
+  auto Y = Tensor::create(ctx, out_shape, DType::FLOAT32);
+  size_t outer = 1; for (int i = 0; i < ax; ++i) outer *= (size_t)X->shape[i];
+  size_t inner = 1; for (int i = ax + 1; i < r; ++i) inner *= (size_t)X->shape[i];
+  for (size_t o = 0; o < outer; ++o) {
+    size_t in_base = o * (size_t)size_d * inner;
+    size_t out_base = o * (size_t)out_len * inner;
+    for (int j = 0; j < out_len; ++j) {
+      int src_j = s + j * step;
+      if (src_j >= s + len) break;
+      for (size_t in = 0; in < inner; ++in) {
+        size_t src = in_base + (size_t)src_j * inner + in;
+        size_t dst = out_base + (size_t)j * inner + in;
+        float v = X->get_as_float_flat(src);
+        Y->set_from_float_flat(dst, v);
+      }
+    }
+  }
+  return Y;
+}
+
+// View variant: returns a non-copying view with strided slicing
+inline TensorPtr slice_view(const TensorPtr &X, int axis, int start, int length, int step = 1) {
+  if (!X) throw std::runtime_error("slice_view: null input");
+  int r = (int)X->shape.size();
+  int ax = axis < 0 ? r + axis : axis;
+  if (ax < 0 || ax >= r) throw std::runtime_error("slice_view: axis out of range");
+  return X->slice_view_step(ax, start, length, step);
+}
+
+inline OpNode make_slice_node(const std::string &in, const std::string &out, int axis, int start, int length, int step = 1) {
+  OpNode n; n.name = "slice"; n.inputs = {in}; n.output = out;
+  n.fn = [axis, start, length, step](const std::vector<TensorPtr> &vs,
+                const std::unordered_map<std::string, std::string> &) {
+    return slice(vs[0], axis, start, length, step);
+  };
+  n.infer = [axis, start, length, step](const std::vector<TensorDesc> &ids,
+                   const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1) throw std::runtime_error("slice infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int ax = axis < 0 ? r + axis : axis;
+    if (ax < 0 || ax >= r) throw std::runtime_error("slice infer: axis out of range");
+    TensorDesc td = ids[0];
+    int size_d = td.shape[ax];
+    int s = start; if (s < 0) s += size_d;
+    if (s < 0 || s >= size_d) throw std::runtime_error("slice infer: start out of range");
+    int len = (length < 0) ? (size_d - s) : length;
+    if (len <= 0 || s + len > size_d) throw std::runtime_error("slice infer: length out of range");
+    int st = std::max(step, 1);
+    int out_len = (st == 1) ? len : (len + st - 1) / st;
+    td.shape[ax] = out_len; td.dtype = DType::FLOAT32; return td;
+  };
+  return n;
+}
+
+inline OpNode make_slice_view_node(const std::string &in, const std::string &out, int axis, int start, int length, int step = 1) {
+  OpNode n; n.name = "slice_view"; n.inputs = {in}; n.output = out;
+  n.fn = [axis, start, length, step](const std::vector<TensorPtr> &vs,
+                const std::unordered_map<std::string, std::string> &) {
+    return slice_view(vs[0], axis, start, length, step);
+  };
+  n.infer = [axis, start, length, step](const std::vector<TensorDesc> &ids,
+                   const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1) throw std::runtime_error("slice_view infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int ax = axis < 0 ? r + axis : axis;
+    if (ax < 0 || ax >= r) throw std::runtime_error("slice_view infer: axis out of range");
+    TensorDesc td = ids[0];
+    int size_d = td.shape[ax];
+    int s = start; if (s < 0) s += size_d;
+    if (s < 0 || s >= size_d) throw std::runtime_error("slice_view infer: start out of range");
+    int len = (length < 0) ? (size_d - s) : length;
+    if (len <= 0 || s + len > size_d) throw std::runtime_error("slice_view infer: length out of range");
+    int st = std::max(step, 1);
+    int out_len = (st == 1) ? len : (len + st - 1) / st;
+    td.shape[ax] = out_len; td.dtype = DType::FLOAT32; return td;
+  };
+  return n;
+}
+
 inline OpNode make_concat_node(const std::vector<std::string> &ins, const std::string &out, int axis) {
   OpNode n; n.name = "concat"; n.inputs = ins; n.output = out;
   n.fn = [axis](const std::vector<TensorPtr> &vs,
@@ -1246,6 +1342,24 @@ inline void register_standard_ops() {
     int axis = attr_i(attrs, "axis", -1);
     return make_concat_node(ins, out, axis);
   });
+  R.register_factory("slice", [](const std::vector<std::string> &ins, const std::string &out,
+                                   const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("slice needs 1 input");
+    int axis = attr_i(attrs, "axis", -1);
+    int start = attr_i(attrs, "start", 0);
+    int length = attr_i(attrs, "length", -1);
+    int step = attr_i(attrs, "step", 1);
+    return make_slice_node(ins[0], out, axis, start, length, step);
+  });
+  R.register_factory("slice_view", [](const std::vector<std::string> &ins, const std::string &out,
+                                       const std::unordered_map<std::string, std::string> &attrs) {
+    if (ins.size() != 1) throw std::runtime_error("slice_view needs 1 input");
+    int axis = attr_i(attrs, "axis", -1);
+    int start = attr_i(attrs, "start", 0);
+    int length = attr_i(attrs, "length", -1);
+    int step = attr_i(attrs, "step", 1);
+    return make_slice_view_node(ins[0], out, axis, start, length, step);
+  });
   R.register_factory("unsqueeze", [](const std::vector<std::string> &ins, const std::string &out,
                                       const std::unordered_map<std::string, std::string> &attrs) {
     if (ins.size() != 1) throw std::runtime_error("unsqueeze needs 1 input");
@@ -1308,6 +1422,14 @@ inline void register_standard_ops() {
 }
 
 // -------------------- 简易 GraphBuilder --------------------
+struct SliceOrder {
+  int start;
+  int length;
+  int axis;
+  int step;
+  SliceOrder(int s, int l, int a, int st = 1) : start(s), length(l), axis(a), step(st) {}
+};
+
 class GraphBuilder {
   ComputeGraph &g;
 public:
@@ -1394,6 +1516,32 @@ public:
   GraphBuilder &concat(const std::vector<std::string> &ins, const std::string &out, int axis) {
     std::unordered_map<std::string, std::string> attrs{{"axis", std::to_string(axis)}};
     return apply("concat", ins, out, attrs);
+  }
+  GraphBuilder &slice(const std::string &in, const std::string &out, int axis, int start, int length, int step = 1) {
+    std::unordered_map<std::string, std::string> attrs{
+      {"axis", std::to_string(axis)},
+      {"start", std::to_string(start)},
+      {"length", std::to_string(length)},
+      {"step", std::to_string(step)}
+    };
+    return apply("slice", {in}, out, attrs);
+  }
+  // Overload mapping (start, length, axis) to existing implementation via SliceOrder
+  GraphBuilder &slice(const std::string &in, const std::string &out, const SliceOrder &order) {
+    return slice(in, out, order.axis, order.start, order.length, order.step);
+  }
+  // View-based slicing node
+  GraphBuilder &slice_view(const std::string &in, const std::string &out, int axis, int start, int length, int step = 1) {
+    std::unordered_map<std::string, std::string> attrs{
+      {"axis", std::to_string(axis)},
+      {"start", std::to_string(start)},
+      {"length", std::to_string(length)},
+      {"step", std::to_string(step)}
+    };
+    return apply("slice_view", {in}, out, attrs);
+  }
+  GraphBuilder &slice_view(const std::string &in, const std::string &out, const SliceOrder &order) {
+    return slice_view(in, out, order.axis, order.start, order.length, order.step);
   }
   GraphBuilder &avg_pool2d(const std::string &in, const std::string &out,
                            int kh = 2, int kw = 2, int sh = 2, int sw = 2,

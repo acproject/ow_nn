@@ -48,11 +48,12 @@ static inline TensorPtr rotate_half(const TensorPtr &x) {
  * @param cos 旋转嵌入的余弦部分。
  * @param sin 旋转嵌入的正弦部分。
  * @param position_ids 已弃用且未使用。
- * @param unsqueeze_dim 指定沿哪个维度对 cos[position_ids] 和 sin[position_ids] 进行 unsqueeze，
- *                      以便它们能与 q 和 k 的维度正确广播。例如，cos[position_ids] 与 sin[position_ids]
- *                      形状为 [batch_size, seq_len, head_dim]，若 q 和 k 形状为 
- *                      [batch_size, heads, seq_len, head_dim]，则设 unsqueeze_dim=1；
- *                      若 q 和 k 形状为 [batch_size, seq_len, heads, head_dim]，则设 unsqueeze_dim=2。
+ * @param unsqueeze_dim 指定沿哪个维度对 cos[position_ids] 和 sin[position_ids]
+ * 进行 unsqueeze， 以便它们能与 q 和 k 的维度正确广播。例如，cos[position_ids]
+ * 与 sin[position_ids] 形状为 [batch_size, seq_len, head_dim]，若 q 和 k 形状为
+ *                      [batch_size, heads, seq_len, head_dim]，则设
+ * unsqueeze_dim=1； 若 q 和 k 形状为 [batch_size, seq_len, heads,
+ * head_dim]，则设 unsqueeze_dim=2。
  * @return std::tuple<TensorPtr> 包含经过旋转位置编码后的 query 和 key 张量。
  */
 static inline std::tuple<TensorPtr, TensorPtr>
@@ -81,4 +82,5 @@ apply_rotary_pos_emb(const TensorPtr &q, const TensorPtr &k,
 
   return std::make_tuple(q_embed, k_embed);
 }
+
 } // namespace ow::nn

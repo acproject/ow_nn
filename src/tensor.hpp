@@ -24,6 +24,21 @@
 namespace ow::nn {
 struct Tensor;
 using TensorPtr = std::shared_ptr<Tensor>;
+
+// Advanced indexing support types
+struct SliceSpec { int start; int length; int step; };
+struct IndexArg {
+  enum Kind { IndexK, SliceK, EllipsisK } kind = SliceK;
+  int index = 0;
+  SliceSpec slice{0, -1, 1};
+  static IndexArg index_of(int i) { IndexArg a; a.kind = IndexK; a.index = i; return a; }
+  static IndexArg from_slice(int start, int length, int step = 1) { IndexArg a; a.kind = SliceK; a.slice = {start, length, step}; return a; }
+  static IndexArg ellipsis() { IndexArg a; a.kind = EllipsisK; return a; }
+};
+inline IndexArg idx(int i) { return IndexArg::index_of(i); }
+inline IndexArg sl(int start, int length, int step = 1) { return IndexArg::from_slice(start, length, step); }
+inline IndexArg ellipsis() { return IndexArg::ellipsis(); }
+
 struct QuantParams {
   float scale = 1.0f;
 };
@@ -272,6 +287,180 @@ public:
     raw->data = static_cast<uint8_t *>(data) + elem_offset * dtype_size(dtype);
     raw->ctx = ctx;
     return std::shared_ptr<Tensor>(shared_from_this(), raw);
+  }
+
+  // Strided slice view along a single axis with step
+  TensorPtr slice_view_step(int axis, int start, int length, int step = 1) {
+    int rank = (int)shape.size();
+    if (axis < 0)
+      axis += rank;
+    if (axis < 0 || axis >= rank)
+      throw std::runtime_error("slice_view_step: axis out of range");
+    if (step <= 0)
+      throw std::runtime_error("slice_view_step: step must be positive");
+    int size_d = shape[axis];
+    if (start < 0)
+      start += size_d;
+    if (start < 0 || start >= size_d)
+      throw std::runtime_error("slice_view_step: start out of range");
+    if (length == -1) {
+      // compute max length respecting step
+      length = (size_d - start + (step - 1)) / step;
+    }
+    if (length <= 0 || start + (length - 1) * step >= size_d)
+      throw std::runtime_error("slice_view_step: length out of range");
+    std::vector<int> new_shape = shape;
+    new_shape[axis] = length;
+    std::vector<int> new_strides = strides;
+    new_strides[axis] = strides[axis] * step;
+    size_t offset_elems = (size_t)start * (size_t)strides[axis];
+    return view(new_shape, new_strides, offset_elems * dtype_size(dtype));
+  }
+
+  // Python-like advanced indexing: supports slices and ellipsis, returns view
+  TensorPtr at(const std::vector<IndexArg> &specs) {
+    int rank = (int)shape.size();
+    int ellipsis_pos = -1;
+    int count_non_ellipsis = 0;
+    for (int i = 0; i < (int)specs.size(); ++i) {
+      if (specs[i].kind == IndexArg::EllipsisK) {
+        if (ellipsis_pos != -1) throw std::runtime_error("at: multiple ellipsis not allowed");
+        ellipsis_pos = i;
+      } else {
+        count_non_ellipsis++;
+      }
+    }
+    int fill = rank - count_non_ellipsis;
+    if (fill < 0) throw std::runtime_error("at: too many indices");
+    std::vector<IndexArg> items;
+    items.reserve(specs.size() + std::max(fill, 0));
+    for (int i = 0; i < (int)specs.size(); ++i) {
+      if (specs[i].kind == IndexArg::EllipsisK) {
+        for (int k = 0; k < fill; ++k) items.push_back(IndexArg::from_slice(0, -1, 1));
+      } else {
+        items.push_back(specs[i]);
+      }
+    }
+    if (ellipsis_pos == -1 && (int)specs.size() < rank) {
+      for (int k = 0; k < rank - (int)specs.size(); ++k) items.push_back(IndexArg::from_slice(0, -1, 1));
+    }
+    TensorPtr cur = shared_from_this();
+    int axis = 0;
+    for (const auto &arg : items) {
+      if (arg.kind == IndexArg::IndexK) {
+        cur = cur->select_view(axis, arg.index);
+        // index removes this dim; axis stays
+      } else if (arg.kind == IndexArg::SliceK) {
+        cur = cur->slice_view_step(axis, arg.slice.start, arg.slice.length, arg.slice.step);
+        axis++; // consumed one dim
+      } else {
+        throw std::runtime_error("at: unresolved ellipsis");
+      }
+    }
+    return cur;
+  }
+  TensorPtr at(std::initializer_list<IndexArg> specs) {
+    return at(std::vector<IndexArg>(specs));
+  }
+
+  // PyTorch-like view helpers: squeeze a size-1 dim and select index along a dim
+  TensorPtr squeeze_dim_view(int dim) {
+    int rank = (int)shape.size();
+    if (dim < 0)
+      dim += rank;
+    if (dim < 0 || dim >= rank)
+      throw std::runtime_error("squeeze_dim_view: dim out of range");
+    if (shape[dim] != 1)
+      throw std::runtime_error("squeeze_dim_view requires dim size==1");
+    std::vector<int> ns;
+    std::vector<int> nstr;
+    ns.reserve(rank - 1);
+    nstr.reserve(rank - 1);
+    for (int i = 0; i < rank; ++i) {
+      if (i == dim)
+        continue;
+      ns.push_back(shape[i]);
+      nstr.push_back(strides[i]);
+    }
+    return view(ns, nstr, 0);
+  }
+
+  TensorPtr select_view(int dim, int index) {
+    int rank = (int)shape.size();
+    if (dim < 0)
+      dim += rank;
+    if (dim < 0 || dim >= rank)
+      throw std::runtime_error("select_view: dim out of range");
+    int size_d = shape[dim];
+    if (index < 0)
+      index += size_d;
+    if (index < 0 || index >= size_d)
+      throw std::runtime_error("select_view: index out of range");
+    std::vector<int> starts(rank, 0);
+    std::vector<int> lengths = shape;
+    starts[dim] = index;
+    lengths[dim] = 1;
+    auto sliced = slice_view(starts, lengths);
+    return sliced->squeeze_dim_view(dim);
+  }
+
+  // Copy out the selected slice (materialize into a new tensor)
+  TensorPtr select_copy(int dim, int index) {
+    auto v = select_view(dim, index);
+    return v->copy();
+  }
+
+  // Convenience: index first dimension and return a copy
+  TensorPtr operator[](int index) {
+    return select_copy(0, index);
+  }
+  TensorPtr operator[](int index) const {
+    return const_cast<Tensor *>(this)->select_copy(0, index);
+  }
+
+  // In-place assignment into this tensor/view region, supports broadcasting
+  void assign_from(const TensorPtr &src) {
+    // Check broadcast compatibility: src can broadcast to destination shape
+    std::vector<int> bshape = broadcast_shape(shape, src->shape);
+    if (bshape != shape)
+      throw std::runtime_error("assign_from: src shape not broadcastable to destination");
+    int rd = (int)shape.size();
+    int rs = (int)src->shape.size();
+    // Iterate over destination indices
+    std::vector<int> idx_d(rd, 0);
+    size_t total = nelements();
+    for (size_t count = 0; count < total; ++count) {
+      // Compute destination element offset using strides
+      size_t off_d = 0;
+      for (int j = 0; j < rd; ++j) off_d += (size_t)idx_d[j] * (size_t)strides[j];
+      // Map to src indices with right-aligned broadcasting
+      std::vector<int> idx_s(rs, 0);
+      for (int j = 0; j < rs; ++j) {
+        int kd = j + (rd - rs);
+        int v = (kd >= 0) ? idx_d[kd] : 0;
+        if (src->shape[j] == 1) v = 0; // broadcast dim
+        idx_s[j] = v;
+      }
+      size_t off_s = 0;
+      for (int j = 0; j < rs; ++j) off_s += (size_t)idx_s[j] * (size_t)src->strides[j];
+      // Write converted value into destination
+      float val = src->get_as_float_flat(off_s);
+      set_from_float_flat(off_d, val);
+      // advance destination index
+      next_index(idx_d, shape);
+    }
+  }
+  // Convenience: assign to a selected index along a dimension (view + assign)
+  void select_assign(int dim, int index, const TensorPtr &src) {
+    auto v = select_view(dim, index);
+    v->assign_from(src);
+  }
+  // Convenience: assign at the last dimension index
+  void assign_last(int index, const TensorPtr &src) { select_assign(-1, index, src); }
+  // Convenience: assign into a strided slice along an axis
+  void slice_assign(int axis, int start, int length, int step, const TensorPtr &src) {
+    auto v = slice_view_step(axis, start, length, step);
+    v->assign_from(src);
   }
 
   // Create a view (shared data pointer, no copy)

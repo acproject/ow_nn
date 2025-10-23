@@ -26,7 +26,48 @@ struct RopeParameters {
   std::optional<std::vector<float>> long_factor;
   std::optional<float> low_freq_factor;
   std::optional<float> high_freq_factor;
+  std::optional<std::unordered_map<std::string, std::vector<int>>>
+      mrope_section;
 };
+
+static inline bool has_mrope_section(
+    const std::optional<std::variant<
+        RopeParameters, std::unordered_map<std::string, RopeParameters>>>
+        &rope_opt) {
+  if (!rope_opt.has_value()) {
+    return false; // rope_parameters 是 nullopt
+  }
+
+  return std::visit(
+      [](const auto &val) -> bool {
+        using T = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<T, RopeParameters>) {
+          // 是单个 RopeParameters，检查其 mrope_section
+          return val.mrope_section.has_value();
+        } else if constexpr (std::is_same_v<
+                                 T, std::unordered_map<std::string,
+                                                       RopeParameters>>) {
+          // 是 map，通常 mrope_section 只在具体的 RopeParameters 实例中
+          // 这里需要定义“是否有”：比如任意一个 value 有？还是都不算？
+          // 通常：map 本身不包含 mrope_section，而是每个 value 有
+          // 所以你可以选择：
+          //   - 检查所有项
+          //   - 或认为 map 类型下“没有全局 mrope_section”
+          // 根据你的语义决定！
+
+          // 示例：只要有一个 RopeParameters 有 mrope_section 就返回 true
+          for (const auto &[key, rp] : val) {
+            if (rp.mrope_section.has_value()) {
+              return true;
+            }
+          }
+          return false;
+        } else {
+          return false; // 不可能走到这里
+        }
+      },
+      rope_opt.value());
+}
 
 struct Qwen3VLTextConfig {
   int vocab_size = 151936;
@@ -347,7 +388,47 @@ struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
   Qwen3VLTextRotaryEmbedding(const std::shared_ptr<Context> &ctx,
                              const Qwen3VLTextConfig &config)
       : LlamaRotaryEmbedding(ctx, to_llama_config(config)) {
-    mrope_section = {24, 20, 20};
+
+    if (has_mrope_section(config.rope_parameters)) {
+      if (config.rope_parameters.has_value()) {
+        const auto &var = config.rope_parameters.value();
+        if (std::holds_alternative<RopeParameters>(var)) {
+          const auto &rp = std::get<RopeParameters>(var);
+          if (rp.mrope_section.has_value()) {
+            const auto &mrope_map = rp.mrope_section.value();
+            if (mrope_map.count("mrope_section")) {
+              mrope_section = mrope_map.at("mrope_section");
+            } else {
+              mrope_section = {24, 20, 20};
+            }
+          } else {
+            mrope_section = {24, 20, 20};
+          }
+        } else {
+          const auto &mp =
+              std::get<std::unordered_map<std::string, RopeParameters>>(var);
+          if (mp.count("mrope_section")) {
+            const auto &rp = mp.at("mrope_section");
+            if (rp.mrope_section.has_value()) {
+              const auto &mrope_map = rp.mrope_section.value();
+              if (mrope_map.count("mrope_section")) {
+                mrope_section = mrope_map.at("mrope_section");
+              } else {
+                mrope_section = {24, 20, 20};
+              }
+            } else {
+              mrope_section = {24, 20, 20};
+            }
+          } else {
+            mrope_section = {24, 20, 20};
+          }
+        }
+      } else {
+        mrope_section = {24, 20, 20};
+      }
+    } else {
+      mrope_section = {24, 20, 20};
+    }
   }
 
   TensorPtr
@@ -361,88 +442,29 @@ struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
       throw std::runtime_error(
           "apply_interleaved_mrope: freqs must be [3,b,seq,dim/2]");
 
-    int batch = freqs->shape[1];
-    int seq_len = freqs->shape[2];
-    int half_dim = freqs->shape[3];
-
     if (mrope_section.size() != 3)
       throw std::runtime_error("mrope_section must have 3 elements [t,h,w]");
 
-    int t_section = mrope_section[0];
-    int h_section = mrope_section[1];
-    int w_section = mrope_section[2];
+    // 将时间维度（T）的频率张量作为基础模板，后续会在其对应切片上覆盖空间维度（H、W)的频率值
+    auto freqs_t = (*freqs)[0]; // 仅保留时间维度的频率进行
 
-    if (t_section + h_section + w_section != half_dim)
-      throw std::runtime_error("Sum of mrope_section must equal dim/2");
-
-    auto output =
-        Tensor::create(ctx, {batch, seq_len, half_dim}, DType::FLOAT32);
-
-    for (int b = 0; b < batch; ++b) {
-      for (int pos = 0; pos < seq_len; ++pos) {
-        int out_idx = 0;
-        int min_section = std::min({t_section, h_section, w_section});
-
-        for (int i = 0; i < min_section; ++i) {
-          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
-                            (size_t)pos * (size_t)half_dim;
-
-          size_t t_off =
-              (size_t)0 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float t_freq = freqs->get_as_float_flat(t_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), t_freq);
-
-          size_t h_off =
-              (size_t)1 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float h_freq = freqs->get_as_float_flat(h_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), h_freq);
-
-          size_t w_off =
-              (size_t)2 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float w_freq = freqs->get_as_float_flat(w_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), w_freq);
-        }
-
-        for (int i = min_section; i < t_section; ++i) {
-          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
-                            (size_t)pos * (size_t)half_dim;
-          size_t t_off =
-              (size_t)0 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float t_freq = freqs->get_as_float_flat(t_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), t_freq);
-        }
-        for (int i = min_section; i < h_section; ++i) {
-          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
-                            (size_t)pos * (size_t)half_dim;
-          size_t h_off =
-              (size_t)1 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float h_freq = freqs->get_as_float_flat(h_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), h_freq);
-        }
-        for (int i = min_section; i < w_section; ++i) {
-          size_t base_out = (size_t)b * (size_t)seq_len * (size_t)half_dim +
-                            (size_t)pos * (size_t)half_dim;
-          size_t w_off =
-              (size_t)2 * (size_t)batch * (size_t)seq_len * (size_t)half_dim +
-              (size_t)b * (size_t)seq_len * (size_t)half_dim +
-              (size_t)pos * (size_t)half_dim + (size_t)i;
-          float w_freq = freqs->get_as_float_flat(w_off);
-          output->set_from_float_flat(base_out + (size_t)(out_idx++), w_freq);
-        }
-      }
+    // 遍历空间维度 dim=1(H)、dim=2(W)，并使用 offset=1、2 交错覆盖
+    for (int dim = 1, offset = 1; dim <= 2; ++dim, ++offset) {
+      /**
+       Python 的 slice(start, stop, step)
+       里，第二个参数是“终止索引（不含）”，例如 stop = mrope_section[dim] * 3
+       ，用 step=3 时会选出 mrope_section[dim] 个位置。 我们的 C++ sl(start,
+       length, step)里，第二个参数是“选取的元素个数”， 不是“终止索引”。因此 C++
+       里应该使用 length = mrope_section[dim] ，不能乘 3。
+       */
+      int length = mrope_section[dim]; // 每个维度的组数（按步长 3 取）
+      // 源视图：freqs[dim, ..., offset:offset+length*3:3]，即步进3的切片
+      auto src = freqs->at({idx(dim), ellipsis(), sl(offset, length, 3)});
+      // 目标赋值：将 src 交错写入 freqs_t 的最后一维
+      freqs_t->slice_assign(-1, offset, length, 3, src);
     }
 
-    return output;
+    return freqs_t;
   }
 
   std::pair<TensorPtr, TensorPtr> forward(const TensorPtr &x,
