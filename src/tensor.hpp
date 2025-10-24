@@ -501,6 +501,102 @@ public:
     return out;
   }
 
+  // PyTorch 风格的类型转换方法，等价于 astype
+  TensorPtr to(DType new_dtype) const {
+    return astype(new_dtype);
+  }
+
+  // Expand tensor to new shape via broadcasting (no data copy, view only)
+  // Only dimensions of size 1 can be expanded to larger sizes
+  TensorPtr expand(const std::vector<int> &new_shape) const {
+    int rank = (int)shape.size();
+    int new_rank = (int)new_shape.size();
+    
+    // Check if expansion is valid
+    if (new_rank < rank) {
+      throw std::runtime_error("expand: new shape must have at least as many dimensions as original");
+    }
+    
+    // Validate that only size-1 dimensions are being expanded
+    for (int i = 0; i < rank; ++i) {
+      int old_dim = shape[rank - 1 - i];  // right-aligned comparison
+      int new_dim = new_shape[new_rank - 1 - i];
+      if (old_dim != 1 && old_dim != new_dim) {
+        throw std::runtime_error("expand: can only expand dimensions of size 1");
+      }
+    }
+    
+    // Create new strides for the expanded tensor
+    std::vector<int> new_strides(new_rank, 0);
+    for (int i = 0; i < new_rank; ++i) {
+      if (i < new_rank - rank) {
+        // New leading dimensions get stride 0 (broadcast)
+        new_strides[i] = 0;
+      } else {
+        int old_idx = i - (new_rank - rank);
+        if (shape[old_idx] == 1) {
+          // Size-1 dimensions get stride 0 (broadcast)
+          new_strides[i] = 0;
+        } else {
+          // Keep original stride
+          new_strides[i] = strides[old_idx];
+        }
+      }
+    }
+    
+    return const_cast<Tensor*>(this)->view(new_shape, new_strides, 0);
+  }
+
+  // Repeat tensor along each dimension (creates new memory)
+  // Each dimension is repeated the specified number of times
+  TensorPtr repeat(const std::vector<int> &repeats) const {
+    if (repeats.size() != shape.size()) {
+      throw std::runtime_error("repeat: repeats must have same length as tensor dimensions");
+    }
+    
+    // Calculate output shape
+    std::vector<int> out_shape(shape.size());
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (repeats[i] <= 0) {
+        throw std::runtime_error("repeat: all repeat counts must be positive");
+      }
+      out_shape[i] = shape[i] * repeats[i];
+    }
+    
+    auto c = ctx.lock();
+    if (!c) throw std::runtime_error("ctx expired");
+    auto out = Tensor::create(c, out_shape, dtype);
+    
+    // Fill the output tensor by repeating the input
+    int rank = (int)shape.size();
+    std::vector<int> out_idx(rank, 0);
+    size_t total_out = out->nelements();
+    
+    for (size_t count = 0; count < total_out; ++count) {
+      // Map output index to input index
+      std::vector<int> in_idx(rank);
+      for (int d = 0; d < rank; ++d) {
+        in_idx[d] = out_idx[d] % shape[d];
+      }
+      
+      // Calculate linear indices
+      size_t in_linear = 0, out_linear = 0;
+      for (int d = 0; d < rank; ++d) {
+        in_linear += (size_t)in_idx[d] * (size_t)strides[d];
+        out_linear += (size_t)out_idx[d] * (size_t)out->strides[d];
+      }
+      
+      // Copy value
+      float val = get_as_float_flat(in_linear);
+      out->set_from_float_flat(out_linear, val);
+      
+      // Advance output index
+      next_index(out_idx, out_shape);
+    }
+    
+    return out;
+  }
+
   // 以 float& 形式返回第 idx 个元素，仅当 dtype 为 FLOAT32 时可用
   float &at_f(size_t idx) {
     assert(dtype == DType::FLOAT32); // 运行时断言：确保数据类型匹配
@@ -1431,6 +1527,105 @@ public:
   // 便捷：元素级正弦
   TensorPtr tensor_sin(const TensorPtr &A) {
     return elementwise_unary(A, [](float a) { return std::sin(a); });
+  }
+
+  // 便捷：元素级幂运算（标量指数）
+  TensorPtr tensor_pow(const TensorPtr &A, float exponent) {
+    return elementwise_unary(A, [exponent](float a) { return std::pow(a, exponent); });
+  }
+
+  // 便捷：元素级幂运算（张量指数）
+  TensorPtr tensor_pow(const TensorPtr &A, const TensorPtr &B) {
+    return elementwise_binary(A, B, [](float a, float b) { return std::pow(a, b); });
+  }
+
+  // 便捷：张量均值（全局）
+  TensorPtr tensor_mean(const TensorPtr &A) {
+    auto ctx = A->ctx.lock();
+    if (!ctx) throw std::runtime_error("ctx expired");
+    
+    size_t n = A->nelements();
+    if (n == 0) throw std::runtime_error("Cannot compute mean of empty tensor");
+    
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      sum += A->get_as_float_flat(i);
+    }
+    float mean_val = sum / static_cast<float>(n);
+    
+    auto result = Tensor::create(ctx, {}, DType::FLOAT32);  // 标量张量
+    result->set_from_float_flat(0, mean_val);
+    return result;
+  }
+
+  // 便捷：张量均值（指定轴）
+  TensorPtr tensor_mean(const TensorPtr &A, int axis, bool keepdim = false) {
+    auto ctx = A->ctx.lock();
+    if (!ctx) throw std::runtime_error("ctx expired");
+    
+    int ndim = static_cast<int>(A->shape.size());
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim) {
+      throw std::runtime_error("axis out of range");
+    }
+    
+    // 计算输出形状
+    std::vector<int> out_shape;
+    for (int i = 0; i < ndim; ++i) {
+      if (i != axis) {
+        out_shape.push_back(A->shape[i]);
+      } else if (keepdim) {
+        out_shape.push_back(1);  // 保持维度，设为1
+      }
+    }
+    if (out_shape.empty()) out_shape = {1};  // 如果所有维度都被移除，结果是标量
+    
+    auto result = Tensor::create(ctx, out_shape, DType::FLOAT32);
+    
+    // 计算沿指定轴的均值
+    size_t axis_size = A->shape[axis];
+    size_t outer_size = 1;
+    size_t inner_size = 1;
+    
+    for (int i = 0; i < axis; ++i) {
+      outer_size *= A->shape[i];
+    }
+    for (int i = axis + 1; i < ndim; ++i) {
+      inner_size *= A->shape[i];
+    }
+    
+    for (size_t outer = 0; outer < outer_size; ++outer) {
+      for (size_t inner = 0; inner < inner_size; ++inner) {
+        float sum = 0.0f;
+        for (size_t ax = 0; ax < axis_size; ++ax) {
+          size_t src_idx = outer * axis_size * inner_size + ax * inner_size + inner;
+          sum += A->get_as_float_flat(src_idx);
+        }
+        float mean_val = sum / static_cast<float>(axis_size);
+        size_t dst_idx = outer * inner_size + inner;
+        result->set_from_float_flat(dst_idx, mean_val);
+      }
+    }
+    
+    return result;
+  }
+
+  // 实例方法：支持链式调用的 pow 操作
+  TensorPtr pow(float exponent) {
+    return tensor_pow(shared_from_this(), exponent);
+  }
+
+  TensorPtr pow(const TensorPtr &exponent) {
+    return tensor_pow(shared_from_this(), exponent);
+  }
+
+  // 实例方法：支持链式调用的 mean 操作
+  TensorPtr mean() {
+    return tensor_mean(shared_from_this());
+  }
+
+  TensorPtr mean(int axis, bool keepdim = false) {
+    return tensor_mean(shared_from_this(), axis, keepdim);
   }
 
   // Specialized Conv3d for Qwen-VL patch embedding

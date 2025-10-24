@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -144,7 +147,7 @@ struct Qwen2RMSNorm {
     if (!ctx)
       throw std::runtime_error("Qwen2RMSNorm: ctx expired");
     weight = Tensor::ones(ctx, {hidden_size}, DType::FLOAT32);
-    size_t n = weight->nelements();
+    // size_t n = weight->nelements();
     // for (size_t i = 0; i < n; ++i)  // 因为采用了ones，所以这里不需要了
     //   weight->set_from_float_flat(i, 1.0f);
   }
@@ -317,14 +320,14 @@ struct LlamaRotaryEmbedding {
       throw std::runtime_error(
           "LlamaRotaryEmbedding: head dim must be even for RoPE");
 
-    auto inv = Tensor::create(ctx, {dim / 2}, DType::FLOAT32);
+    auto inv_freq = Tensor::create(ctx, {dim / 2}, DType::FLOAT32);
     for (int i = 0; i < dim / 2; ++i) {
       float exponent = (2.0f * (float)i) / (float)dim;
       float val = 1.0f / std::pow(base, exponent);
-      inv->set_from_float_flat((size_t)i, val);
+      inv_freq->set_from_float_flat((size_t)i, val);
     }
     float attention_factor = 1.0f; // Unused for default RoPE
-    return {inv, attention_factor};
+    return {inv_freq, attention_factor};
   }
 
   LlamaRotaryEmbedding(const std::shared_ptr<Context> &ctx,
@@ -477,24 +480,12 @@ struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
 
     TensorPtr pos3;
     if (position_ids->shape.size() == 2) {
+      // Python: position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+      // C++: unsqueeze(0) -> expand({3, B, S})
       int B = position_ids->shape[0];
       int S = position_ids->shape[1];
-      pos3 = Tensor::create(ctx, {3, B, S}, DType::FLOAT32);
-      for (int b = 0; b < B; ++b) {
-        for (int s = 0; s < S; ++s) {
-          float v = position_ids->get_as_float_flat((size_t)b * (size_t)S +
-                                                    (size_t)s);
-          pos3->set_from_float_flat((size_t)0 * (size_t)B * (size_t)S +
-                                        (size_t)b * (size_t)S + (size_t)s,
-                                    v);
-          pos3->set_from_float_flat((size_t)1 * (size_t)B * (size_t)S +
-                                        (size_t)b * (size_t)S + (size_t)s,
-                                    v);
-          pos3->set_from_float_flat((size_t)2 * (size_t)B * (size_t)S +
-                                        (size_t)b * (size_t)S + (size_t)s,
-                                    v);
-        }
-      }
+      auto pos_unsqueezed = unsqueeze(position_ids, 0); // [1, B, S]
+      pos3 = pos_unsqueezed->expand({3, B, S});         // [3, B, S]
     } else if (position_ids->shape.size() == 3 && position_ids->shape[0] == 3) {
       pos3 = position_ids;
     } else {
@@ -506,38 +497,72 @@ struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
     int S = pos3->shape[2];
     int half_dim = (int)inv_freq->shape[0];
 
-    auto freqs = Tensor::create(ctx, {3, B, S, half_dim}, DType::FLOAT32);
-    for (int dim_idx = 0; dim_idx < 3; ++dim_idx) {
-      for (int b = 0; b < B; ++b) {
-        for (int s = 0; s < S; ++s) {
-          float p =
-              pos3->get_as_float_flat((size_t)dim_idx * (size_t)B * (size_t)S +
-                                      (size_t)b * (size_t)S + (size_t)s);
-          for (int i = 0; i < half_dim; ++i) {
-            float iv = inv_freq->get_as_float_flat((size_t)i);
-            float v = iv * p;
-            size_t off =
-                (size_t)dim_idx * (size_t)B * (size_t)S * (size_t)half_dim +
-                (size_t)b * (size_t)S * (size_t)half_dim +
-                (size_t)s * (size_t)half_dim + (size_t)i;
-            freqs->set_from_float_flat(off, v);
-          }
-        }
-      }
-    }
+    // Python equivalent:
+    // inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3,
+    // position_ids.shape[1], -1) position_ids_expanded = position_ids[:, :,
+    // None, :].float() # shape(3, bs, 1, positions) freqs =
+    // (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2,
+    // 3)
+
+    // inv_freq: [half_dim] -> [1, 1, half_dim, 1] -> [3, B, half_dim, 1]
+    auto inv_freq_4d = inv_freq->reshape_view({1, 1, half_dim, 1});
+    auto inv_freq_expanded = inv_freq_4d->expand({3, B, half_dim, 1});
+
+    // pos3: [3, B, S] -> [3, B, 1, S]
+    auto pos3_4d = pos3->reshape_view({3, B, 1, S});
+
+    // Matrix multiplication: [3, B, half_dim, 1] @ [3, B, 1, S] -> [3, B,
+    // half_dim, S]
+    auto freqs_raw = Tensor::matmul_cache_friendly(inv_freq_expanded, pos3_4d);
+
+    // Transpose last two dimensions: [3, B, half_dim, S] -> [3, B, S, half_dim]
+    auto freqs = freqs_raw->transpose_view(-2, -1);
 
     auto freqs_t = apply_interleaved_mrope(freqs, mrope_section);
 
     auto emb = concat({freqs_t, freqs_t}, -1);
 
-    auto cos = emb->elementwise_unary(emb, [this](float vv) {
-      return std::cos(vv) * this->attention_scaling;
-    });
-    auto sin = emb->elementwise_unary(emb, [this](float vv) {
-      return std::sin(vv) * this->attention_scaling;
-    });
+    auto cos = emb->tensor_cos(emb);
+    auto sin = emb->tensor_sin(emb);
+
+    // Apply attention scaling
+    if (attention_scaling != 1.0f) {
+      cos = cos->elementwise_unary(
+          cos, [this](float v) { return v * this->attention_scaling; });
+      sin = sin->elementwise_unary(
+          sin, [this](float v) { return v * this->attention_scaling; });
+    }
 
     return {cos, sin};
+  }
+};
+
+struct Qwen3RMSNorm {
+  TensorPtr weight;
+  float variance_epsilon;
+  Qwen3RMSNorm(const std::shared_ptr<Context> &ctx, int hidden_size,
+               float eps = 1e-6) {
+    if (!ctx)
+      throw std::runtime_error("Qwen3RMSNorm: ctx expired");
+    weight = Tensor::ones(ctx, {hidden_size}, DType::FLOAT32);
+    variance_epsilon = eps;
+  }
+  TensorPtr forward(const TensorPtr &hidden_states) {
+    if (!hidden_states || !weight)
+      throw std::runtime_error("Qwen3RMSNorm: null input or weight");
+    auto ctx = hidden_states->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("Qwen3RMSNorm: ctx expired");
+    auto shape = hidden_states->shape;
+    if (shape.empty())
+      throw std::runtime_error("Qwen3RMSNorm: input rank must be >= 1");
+    // 获取最后一个维度作为hidden_size, 其余维度合并为 batch_seq
+    int hidden_size = shape.back();
+    auto input_dtype = hidden_states->dtype;
+    size_t batch_seq = hidden_states->nelements() / hidden_size;
+    auto in_dtype = hidden_states->dtype;
+    auto variance = hidden_states->pow(2)->mean(-1, true);
+    return Tensor::matmul_cache_friendly(weight, variance)->astype(input_dtype);
   }
 };
 
