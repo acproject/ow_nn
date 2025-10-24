@@ -13,6 +13,9 @@
 
 namespace ow::nn {
 
+// Forward declaration of Activation enum (defined in utils.hpp)
+enum class Activation : int;
+
 // -------------------- helpers --------------------
 static inline std::shared_ptr<Context> get_ctx_or_throw(const TensorPtr &T) {
   auto ctx = T->ctx.lock();
@@ -103,6 +106,21 @@ inline TensorPtr gelu(const TensorPtr &X, bool approximate = true) {
       float y = 0.5f * x * (1.0f + std::erf(x * inv_sqrt2));
       Y->set_from_float_flat(i, y);
     }
+  }
+  return Y;
+}
+
+inline TensorPtr gelu_pytorch_tahn(const TensorPtr &X) {
+  auto ctx = get_ctx_or_throw(X);
+  auto Y = Tensor::create(ctx, X->shape, DType::FLOAT32);
+  size_t n = X->nelements();
+  const float k0 = std::sqrt(2.0f / 3.14159265358979323846f);
+  for (size_t i = 0; i < n; ++i) {
+    float x = X->get_as_float_flat(i);
+    float x3 = x * x * x;
+    float t = std::tanh(k0 * (x + 0.044715f * x3));
+    float y = 0.5f * x * (1.0f + t);
+    Y->set_from_float_flat(i, y);
   }
   return Y;
 }
@@ -685,6 +703,24 @@ inline OpNode make_softmax_node(const std::string &in, const std::string &out,
   n.fn = [axis](const std::vector<TensorPtr> &ins,
                 const std::unordered_map<std::string, std::string> &) {
     return softmax(ins[0], axis);
+  };
+  n.infer = [](const std::vector<TensorDesc> &in_descs,
+               const std::unordered_map<std::string, std::string> &) {
+    auto td = in_descs[0];
+    td.dtype = DType::FLOAT32;
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_silu_node(const std::string &in, const std::string &out) {
+  OpNode n;
+  n.name = "silu";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &ins,
+            const std::unordered_map<std::string, std::string> &) {
+    return silu(ins[0]);
   };
   n.infer = [](const std::vector<TensorDesc> &in_descs,
                const std::unordered_map<std::string, std::string> &) {
@@ -2148,6 +2184,13 @@ inline void register_standard_ops() {
         int axis = attr_i(attrs, "axis", -1);
         return make_softmax_node(ins[0], out, axis);
       });
+  R.register_factory(
+      "silu", [](const std::vector<std::string> &ins, const std::string &out,
+                  const std::unordered_map<std::string, std::string> &) {
+        if (ins.size() != 1)
+          throw std::runtime_error("silu needs 1 input");
+        return make_silu_node(ins[0], out);
+      });
   // linear & matmul & elementwise
   R.register_factory(
       "linear", [](const std::vector<std::string> &ins, const std::string &out,
@@ -2599,6 +2642,13 @@ public:
                  std::unordered_map<std::string, std::string>{
                      {"axis", std::to_string(axis)}});
   }
+  GraphBuilder &silu(const std::string &in, const std::string &out) {
+    return apply("silu", {in}, out);
+  }
+  // Convenience: apply activation via enum (implementation in utils.hpp)
+  GraphBuilder &apply_activation(const std::string &in, const std::string &out,
+                                 Activation act, int axis = -1,
+                                 bool gelu_approximate = true);
   GraphBuilder &layer_norm(const std::string &x, const std::string &g,
                            const std::string &b, const std::string &y,
                            int axis = -1, float eps = 1e-5f) {

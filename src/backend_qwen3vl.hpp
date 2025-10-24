@@ -80,7 +80,7 @@ struct Qwen3VLTextConfig {
   int num_attention_heads = 32;
   int num_key_value_heads = 32;
   int head_dim = 128;
-  std::string hidden_act = "silu";
+  std::variant<TensorPtr, std::string> hidden_act = "silu";
   int max_position_embeddings = 128000;
   double initializer_range = 0.02;
   double rms_norm_eps = 1e-6;
@@ -106,7 +106,7 @@ struct Qwen3VLVisionConfig {
   static inline const std::string base_config_key = "vision_config";
   int depth = 27;
   int hidden_size = 1152;
-  std::string hidden_act = "gelu_pytorch_tahn";
+  std::variant<TensorPtr, std::string> hidden_act = "gelu_pytorch_tahn";
   int intermediate_size = 4304;
   int num_heads = 16;
   int in_channels = 3;
@@ -572,6 +572,193 @@ struct Qwen3RMSNorm {
   }
 };
 
+struct PastKeyValueCache {
+  std::shared_ptr<Context> ctx;
+  int num_layers;
+  int num_kv_heads;
+  int head_dim;
+  int max_seq_len;
+  int batch_size;
+  std::vector<TensorPtr> k_caches; // per-layer: [B, L_max, Kvh, D]
+  std::vector<TensorPtr> v_caches; // per-layer: [B, L_max, Kvh, D]
+  std::vector<int>
+      cache_len_per_batch; // assume uniform length across batch for now
+
+  PastKeyValueCache(const std::shared_ptr<Context> &ctx, int num_layers,
+                    int num_kv_heads, int head_dim, int max_seq_len)
+      : ctx(ctx), num_layers(num_layers), num_kv_heads(num_kv_heads),
+        head_dim(head_dim), max_seq_len(max_seq_len), batch_size(0) {
+    if (!ctx)
+      throw std::runtime_error("PastKeyValueCache: ctx expired");
+    k_caches.resize(num_layers);
+    v_caches.resize(num_layers);
+  }
+
+  void ensure_initialized(int B) {
+    if (batch_size == B && k_caches[0])
+      return;
+    batch_size = B;
+    cache_len_per_batch.assign(B, 0);
+    for (int l = 0; l < num_layers; ++l) {
+      k_caches[l] = Tensor::create(
+          ctx, {B, max_seq_len, num_kv_heads, head_dim}, DType::FLOAT32);
+      v_caches[l] = Tensor::create(
+          ctx, {B, max_seq_len, num_kv_heads, head_dim}, DType::FLOAT32);
+    }
+  }
+
+  int active_seq_len() const {
+    if (cache_len_per_batch.empty())
+      return 0;
+    int lmin = cache_len_per_batch[0];
+    for (int b = 1; b < batch_size; ++b) {
+      lmin = std::min(lmin, cache_len_per_batch[b]);
+    }
+    return lmin;
+  }
+
+  // cache_position-aware update overload for static cache semantics
+  std::pair<TensorPtr, TensorPtr> update(const TensorPtr &key_states,
+                                         const TensorPtr &value_states,
+                                         int layer_idx, int sliding_window,
+                                         const TensorPtr &cache_position) {
+    if (!key_states || !value_states)
+      throw std::runtime_error("PastKeyValueCache.update: null K/V");
+    auto key_ctx = key_states->ctx.lock();
+    if (!key_ctx)
+      throw std::runtime_error("PastKeyValueCache.update: ctx expired");
+    int B = key_states->shape[0];
+    int Kvh = key_states->shape[1];
+    int S_new = key_states->shape[2];
+    int D = key_states->shape[3];
+    ensure_initialized(B);
+
+    bool has_static_pos = (cache_position != nullptr);
+
+    // Append or static write per batch
+    for (int b = 0; b < B; ++b) {
+      int prev_len = cache_len_per_batch[b];
+      int total_len = prev_len + S_new;
+      int max_written_pos = prev_len - 1; // track max position written
+
+      for (int j = 0; j < S_new; ++j) {
+        int dst_seq;
+        if (has_static_pos) {
+          // cache_position can be shape [B, S_new] or [S_new]; interpret as
+          // absolute positions
+          int pos_index;
+          if ((int)cache_position->shape.size() == 2) {
+            // [B, S_new]
+            pos_index = (int)cache_position->get_as_float_flat(
+                ((size_t)b * (size_t)cache_position->shape[1]) + (size_t)j);
+          } else if ((int)cache_position->shape.size() == 1) {
+            // [S_new]
+            pos_index = (int)cache_position->get_as_float_flat((size_t)j);
+          } else {
+            throw std::runtime_error(
+                "PastKeyValueCache.update: cache_position must be 1D or 2D");
+          }
+          dst_seq = std::max(0, std::min(pos_index, max_seq_len - 1));
+        } else {
+          dst_seq = prev_len + j;
+        }
+        if (dst_seq >= max_seq_len)
+          break; // overflow guard
+        max_written_pos = std::max(max_written_pos, dst_seq);
+
+        for (int kvh = 0; kvh < num_kv_heads; ++kvh) {
+          for (int d = 0; d < head_dim; ++d) {
+            // src index in key_states: [B, Kvh, S_new, D]
+            size_t k_src = ((size_t)b * (size_t)num_kv_heads * (size_t)S_new *
+                            (size_t)head_dim) +
+                           ((size_t)kvh * (size_t)S_new * (size_t)head_dim) +
+                           ((size_t)j * (size_t)head_dim) + (size_t)d;
+            float k_val = key_states->get_as_float_flat(k_src);
+            // dst index in cache: [B, L_max, Kvh, D]
+            size_t k_dst =
+                ((size_t)b * (size_t)max_seq_len * (size_t)num_kv_heads *
+                 (size_t)head_dim) +
+                ((size_t)dst_seq * (size_t)num_kv_heads * (size_t)head_dim) +
+                ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+            k_caches[layer_idx]->set_from_float_flat(k_dst, k_val);
+
+            size_t v_src = ((size_t)b * (size_t)num_kv_heads * (size_t)S_new *
+                            (size_t)head_dim) +
+                           ((size_t)kvh * (size_t)S_new * (size_t)head_dim) +
+                           ((size_t)j * (size_t)head_dim) + (size_t)d;
+            float v_val = value_states->get_as_float_flat(v_src);
+            size_t v_dst =
+                ((size_t)b * (size_t)max_seq_len * (size_t)num_kv_heads *
+                 (size_t)head_dim) +
+                ((size_t)dst_seq * (size_t)num_kv_heads * (size_t)head_dim) +
+                ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+            v_caches[layer_idx]->set_from_float_flat(v_dst, v_val);
+          }
+        }
+      }
+
+      // Update active length: for static cache use max_written_pos+1; for
+      // dynamic append use min(total_len, max_seq_len)
+      if (has_static_pos)
+        cache_len_per_batch[b] = std::min(max_written_pos + 1, max_seq_len);
+      else
+        cache_len_per_batch[b] = std::min(total_len, max_seq_len);
+    }
+
+    // Sliding window compaction only in dynamic mode
+    if (!has_static_pos && sliding_window > 0) {
+      for (int b = 0; b < B; ++b) {
+        int L = cache_len_per_batch[b];
+        if (L > sliding_window) {
+          int src_start = L - sliding_window;
+          for (int j = 0; j < sliding_window; ++j) {
+            int dst_seq = j;
+            int src_seq = src_start + j;
+            for (int kvh = 0; kvh < num_kv_heads; ++kvh) {
+              for (int d = 0; d < head_dim; ++d) {
+                size_t k_src = ((size_t)b * (size_t)max_seq_len *
+                                (size_t)num_kv_heads * (size_t)head_dim) +
+                               ((size_t)src_seq * (size_t)num_kv_heads *
+                                (size_t)head_dim) +
+                               ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+                float k_val = k_caches[layer_idx]->get_as_float_flat(k_src);
+                size_t k_dst = ((size_t)b * (size_t)max_seq_len *
+                                (size_t)num_kv_heads * (size_t)head_dim) +
+                               ((size_t)dst_seq * (size_t)num_kv_heads *
+                                (size_t)head_dim) +
+                               ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+                k_caches[layer_idx]->set_from_float_flat(k_dst, k_val);
+
+                size_t v_src = ((size_t)b * (size_t)max_seq_len *
+                                (size_t)num_kv_heads * (size_t)head_dim) +
+                               ((size_t)src_seq * (size_t)num_kv_heads *
+                                (size_t)head_dim) +
+                               ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+                float v_val = v_caches[layer_idx]->get_as_float_flat(v_src);
+                size_t v_dst = ((size_t)b * (size_t)max_seq_len *
+                                (size_t)num_kv_heads * (size_t)head_dim) +
+                               ((size_t)dst_seq * (size_t)num_kv_heads *
+                                (size_t)head_dim) +
+                               ((size_t)kvh * (size_t)head_dim) + (size_t)d;
+                v_caches[layer_idx]->set_from_float_flat(v_dst, v_val);
+              }
+            }
+          }
+          cache_len_per_batch[b] = sliding_window;
+        }
+      }
+    }
+
+    // Build output slices: [B, Kvh, L_active, D]
+    int L_active = active_seq_len();
+    auto k_slice = k_caches[layer_idx]->slice_view_step(1, 0, L_active, 1);
+    auto v_slice = v_caches[layer_idx]->slice_view_step(1, 0, L_active, 1);
+    auto k_out = permute_view(k_slice, {0, 2, 1, 3});
+    auto v_out = permute_view(v_slice, {0, 2, 1, 3});
+    return {k_out, v_out};
+  }
+};
+
 struct Qwen3Attention {
   /// Multi-headed attention from 'Attention Is All You Need' paper
 
@@ -605,6 +792,12 @@ struct Qwen3Attention {
   std::unique_ptr<Qwen3RMSNorm> q_norm;
   std::unique_ptr<Qwen3RMSNorm> k_norm;
 
+  // Legacy single-batch KV cache state (per layer)
+  mutable TensorPtr k_cache;
+  mutable TensorPtr v_cache;
+  mutable int cache_len = 0;
+  mutable int max_seq_len_cached = 0;
+
   Qwen3Attention(const std::shared_ptr<Context> &ctx,
                  const Qwen3VLTextConfig &config, int layer_idx)
       : ctx(ctx), config(config), layer_idx(layer_idx) {
@@ -618,52 +811,43 @@ struct Qwen3Attention {
       layer_type = (*config.layer_types)[layer_idx];
     }
 
-    // Calculate head_dim (similar to Python: getattr(config, "head_dim",
-    // config.hidden_size // config.num_attention_heads))
+    // head_dim from config or derive
     head_dim = config.head_dim > 0
                    ? config.head_dim
                    : config.hidden_size / config.num_attention_heads;
 
-    // Calculate num_key_value_groups
+    // key/value groups
     num_key_value_groups =
         config.num_attention_heads / config.num_key_value_heads;
 
-    // Calculate scaling factor
+    // scaling
     scaling = std::pow(head_dim, -0.5f);
 
-    // Set attention parameters
     attention_dropout = config.attention_dropout;
     is_causal = true;
 
-    // Set sliding window
+    // sliding window if layer type is sliding_attention
     if (layer_type.has_value() && layer_type.value() == "sliding_attention") {
       sliding_window = config.sliding_window;
     } else {
       sliding_window = std::nullopt;
     }
 
-    // Initialize projection layer weights
-    // q_proj: [hidden_size, num_attention_heads * head_dim]
+    // Initialize projection weights
     q_proj_weight = Tensor::create(
         ctx, {config.hidden_size, config.num_attention_heads * head_dim},
         DType::FLOAT32);
-
-    // k_proj: [hidden_size, num_key_value_heads * head_dim]
     k_proj_weight = Tensor::create(
         ctx, {config.hidden_size, config.num_key_value_heads * head_dim},
         DType::FLOAT32);
-
-    // v_proj: [hidden_size, num_key_value_heads * head_dim]
     v_proj_weight = Tensor::create(
         ctx, {config.hidden_size, config.num_key_value_heads * head_dim},
         DType::FLOAT32);
-
-    // o_proj: [num_attention_heads * head_dim, hidden_size]
     o_proj_weight = Tensor::create(
         ctx, {config.num_attention_heads * head_dim, config.hidden_size},
         DType::FLOAT32);
 
-    // Initialize bias tensors if attention_bias is enabled
+    // Optional biases
     if (config.attention_bias) {
       q_proj_bias = Tensor::create(ctx, {config.num_attention_heads * head_dim},
                                    DType::FLOAT32);
@@ -674,12 +858,15 @@ struct Qwen3Attention {
       o_proj_bias = Tensor::create(ctx, {config.hidden_size}, DType::FLOAT32);
     }
 
-    // Initialize RMS normalization layers
+    // RMSNorm layers
     q_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
     k_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+
+    // KV cache capacity
+    max_seq_len_cached = config.max_position_embeddings;
   }
 
-  // Linear projection helper functions
+  // Linear projection helpers
   TensorPtr q_proj(const TensorPtr &x) const {
     if (config.attention_bias && q_proj_bias) {
       return Tensor::linear(x, q_proj_weight, q_proj_bias);
@@ -710,6 +897,246 @@ struct Qwen3Attention {
     } else {
       return Tensor::linear(x, o_proj_weight);
     }
+  }
+
+  // Legacy single-batch cache init
+  void init_cache(int max_len) const {
+    if (!ctx)
+      throw std::runtime_error("Qwen3Attention::init_cache: ctx expired");
+    k_cache = Tensor::create(
+        ctx, {max_len, config.num_key_value_heads, head_dim}, DType::FLOAT32);
+    v_cache = Tensor::create(
+        ctx, {max_len, config.num_key_value_heads, head_dim}, DType::FLOAT32);
+    cache_len = 0;
+  }
+
+  // Convenience overloads
+  TensorPtr forward(const TensorPtr &hidden_states, const TensorPtr &cos,
+                    const TensorPtr &sin) const {
+    return forward(hidden_states, cos, sin, nullptr, nullptr);
+  }
+
+  TensorPtr forward(const TensorPtr &hidden_states, const TensorPtr &cos,
+                    const TensorPtr &sin,
+                    const TensorPtr &attention_mask) const {
+    return forward(hidden_states, cos, sin, attention_mask, nullptr);
+  }
+
+  // Cache-aware attention main path
+  TensorPtr
+  forward(const TensorPtr &hidden_states, const TensorPtr &cos,
+          const TensorPtr &sin, const TensorPtr &attention_mask,
+          const std::shared_ptr<PastKeyValueCache> &past_key_values) const {
+    if (!hidden_states || !cos || !sin)
+      throw std::runtime_error("Qwen3Attention::forward: null input");
+    auto ctx_local = hidden_states->ctx.lock();
+    if (!ctx_local)
+      throw std::runtime_error("Qwen3Attention::forward: ctx expired");
+
+    int rank = (int)hidden_states->shape.size();
+    if (rank != 2 && rank != 3)
+      throw std::runtime_error(
+          "Qwen3Attention::forward: hidden_states must be [S,H] or [B,S,H]");
+
+    int B = (rank == 3) ? hidden_states->shape[0] : 1;
+    int S = (rank == 3) ? hidden_states->shape[1] : hidden_states->shape[0];
+    int Hsz = (rank == 3) ? hidden_states->shape[2] : hidden_states->shape[1];
+
+    // Flatten to [B*S, H]
+    int BS = B * S;
+    TensorPtr hs2d = hidden_states->is_contiguous_row_major()
+                         ? hidden_states->reshape_view({BS, Hsz})
+                         : hidden_states->copy()->reshape_view({BS, Hsz});
+
+    // Q/K/V projections
+    auto q_all = q_proj(hs2d);
+    auto k_all = k_proj(hs2d);
+    auto v_all = v_proj(hs2d);
+
+    int num_heads = config.num_attention_heads;
+    int num_kv_heads = config.num_key_value_heads;
+
+    // Reshape to [B,S,heads,D] then permute to [B,heads,S,D]
+    auto q_4d = q_all->reshape_view({B, S, num_heads, head_dim});
+    auto k_4d = k_all->reshape_view({B, S, num_kv_heads, head_dim});
+    auto v_4d = v_all->reshape_view({B, S, num_kv_heads, head_dim});
+
+    auto q = permute_view(q_4d, {0, 2, 1, 3});
+    auto k = permute_view(k_4d, {0, 2, 1, 3});
+    auto v = permute_view(v_4d, {0, 2, 1, 3});
+
+    // RMSNorm and scale
+    float eps = (float)config.rms_norm_eps;
+    auto rms_inline = [eps](const TensorPtr &x) -> TensorPtr {
+      auto var = x->pow(2.0f)->mean(-1, true);
+      auto rsqrt = var->elementwise_unary(
+          var, [eps](float v) { return 1.0f / std::sqrt(v + eps); });
+      return x->tensor_mul(x, rsqrt);
+    };
+    q = rms_inline(q);
+    k = rms_inline(k);
+    if (q_norm && q_norm->weight)
+      q = q->tensor_mul(q, q_norm->weight);
+    if (k_norm && k_norm->weight)
+      k = k->tensor_mul(k, k_norm->weight);
+    float scale = scaling;
+    q = q->elementwise_unary(q, [scale](float v) { return v * scale; });
+
+    // RoPE
+    auto qk_rot = ow::nn::apply_rotary_pos_emb(q, k, cos, sin, nullptr,
+                                               /*unsqueeze_dim=*/1);
+    q = std::get<0>(qk_rot);
+    k = std::get<1>(qk_rot);
+
+    // Use external cache if provided
+    TensorPtr k_active;
+    TensorPtr v_active;
+    int L_keys = S;
+    int L_prev = 0;
+    if (past_key_values) {
+      auto kv = past_key_values->update(k, v, layer_idx,
+                                        sliding_window.value_or(-1), nullptr);
+      k_active = kv.first;
+      v_active = kv.second;
+      L_keys = past_key_values->active_seq_len();
+      L_prev = std::max(0, L_keys - S);
+    } else {
+      k_active = k;
+      v_active = v;
+    }
+
+    auto attn_out =
+        Tensor::create(ctx_local, {B, num_heads, S, head_dim}, DType::FLOAT32);
+
+    // Compute per batch/head attention
+    for (int b = 0; b < B; ++b) {
+      for (int hidx = 0; hidx < num_heads; ++hidx) {
+        int group_size = std::max(1, num_heads / num_kv_heads);
+        int kv_h = hidx / group_size;
+        auto q_bh = q->select_view(0, b)->select_view(0, hidx);
+        auto k_bkv = k_active->select_view(0, b)->select_view(0, kv_h);
+        auto k_T = k_bkv->transpose_view(0, 1);
+        auto scores = Tensor::matmul_cache_friendly(q_bh, k_T); // [S, L_keys]
+
+        // Causal mask
+        const float NEG_INF = -1e9f;
+        auto causal_mask =
+            Tensor::create(ctx_local, {S, L_keys}, DType::FLOAT32);
+        for (int i = 0; i < S; ++i) {
+          int i_abs = L_prev + i;
+          for (int j = 0; j < L_keys; ++j) {
+            float m = (j > i_abs) ? NEG_INF : 0.0f;
+            causal_mask->set_from_float_flat((size_t)i * L_keys + j, m);
+          }
+        }
+        scores = scores->tensor_add(scores, causal_mask);
+
+        // Attention mask broadcastable to [S, L_keys]
+        if (attention_mask) {
+          if (attention_mask->shape.size() == 4) {
+            auto am2d = attention_mask->select_view(0, b)->select_view(0, 0);
+            scores = scores->tensor_add(scores, am2d);
+          } else if (attention_mask->shape.size() == 3) {
+            auto kv_mask = attention_mask->select_view(0, b)->select_view(0, 0);
+            auto kv2d = kv_mask->reshape_view({1, L_keys})->repeat({S, 1});
+            scores = scores->tensor_add(scores, kv2d);
+          } else if (attention_mask->shape.size() == 2) {
+            auto kv_mask = attention_mask->select_view(0, b);
+            auto kv2d = kv_mask->reshape_view({1, L_keys})->repeat({S, 1});
+            scores = scores->tensor_add(scores, kv2d);
+          }
+        }
+
+        auto weights = ow::nn::softmax(scores, -1);
+        auto v_bkv = v_active->select_view(0, b)->select_view(0, kv_h);
+        auto context = Tensor::matmul_cache_friendly(weights, v_bkv);
+
+        for (int i = 0; i < S; ++i) {
+          for (int d = 0; d < head_dim; ++d) {
+            float val = context->get_as_float_flat((size_t)i * head_dim + d);
+            size_t dst = ((size_t)b * num_heads * S * head_dim) +
+                         ((size_t)hidx * S * head_dim) +
+                         ((size_t)i * head_dim) + d;
+            attn_out->set_from_float_flat(dst, val);
+          }
+        }
+      }
+    }
+
+    auto attn_flat = permute_view(attn_out, {0, 2, 1, 3})
+                         ->reshape_view({BS, num_heads * head_dim});
+    auto out = o_proj(attn_flat);
+    if (rank == 3) {
+      return out->reshape_view({B, S, Hsz});
+    } else {
+      return out->reshape_view({S, Hsz});
+    }
+  }
+};
+
+struct Qwen3MLP {
+  int hidden_size = 0;
+  int intermediate_size = 0;
+  TensorPtr gate_proj;
+  TensorPtr up_proj;
+  TensorPtr down_proj;
+  std::variant<TensorPtr, std::string> act_fn;
+
+  Qwen3MLP(const std::shared_ptr<Context> &ctx,
+           const Qwen3VLTextConfig &config) {
+    if (!ctx)
+      throw std::runtime_error("Qwen3MLP: ctx expired");
+    // 原因：如果 config.hidden_size 不大于 0，说明配置非法，抛出异常以终止构造
+    hidden_size = config.hidden_size > 0
+                      ? config.hidden_size
+                      : throw std::runtime_error(
+                            "Qwen3MLP: hidden_size must be positive");
+    intermediate_size =
+        config.intermediate_size > 0
+            ? config.intermediate_size
+            : throw std::runtime_error(
+                  "Qwen3MLP: intermediate_size must be positive");
+
+    // // config.hidden_act 是 std::variant<TensorPtr,
+    // std::string>，需要判断类型 if
+    // (std::holds_alternative<std::string>(config.hidden_act)) {
+    //   act_fn = std::get<std::string>(config.hidden_act);
+    // } else {
+    //   auto ptr = std::get<TensorPtr>(config.hidden_act);
+    //   if (ptr) {
+    //     act_fn = ptr;
+    //   } else {
+    //     // 如果 TensorPtr 为空，则退回到默认字符串
+    //     act_fn = std::string("silu");
+    //   }
+    // }
+    act_fn = config.hidden_act;
+
+    gate_proj = Tensor::linear(gate_proj, hidden_size, intermediate_size, false)
+                    ->astype(DType::FLOAT32);
+    up_proj = Tensor::linear(up_proj, hidden_size, intermediate_size, false)
+                  ->astype(DType::FLOAT32);
+    down_proj = Tensor::linear(down_proj, intermediate_size, hidden_size, false)
+                    ->astype(DType::FLOAT32);
+  }
+  TensorPtr forward(const TensorPtr &x) {
+    if (std::holds_alternative<std::string>(act_fn)) {
+      const auto &act_str = std::get<std::string>(act_fn);
+      if (!act_str.empty()) {
+        // 根据字符串名称应用激活函数并继续后续计算
+        auto gate = (*this->gate_proj)(x);
+        auto up = (*this->up_proj)(x);
+        auto activated = apply_activation(gate, act_str);
+        down_proj = down_proj->tensor_mul(activated, up);
+      }
+    } else if (std::holds_alternative<TensorPtr>(act_fn)) {
+      const auto &act_tensor = std::get<TensorPtr>(act_fn);
+      if (act_tensor) {
+        down_proj = down_proj->tensor_mul(
+            act_tensor->silu((*this->gate_proj)(x)), (*this->up_proj)(x));
+      }
+    }
+    return down_proj;
   }
 };
 

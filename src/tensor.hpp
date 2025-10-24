@@ -26,17 +26,37 @@ struct Tensor;
 using TensorPtr = std::shared_ptr<Tensor>;
 
 // Advanced indexing support types
-struct SliceSpec { int start; int length; int step; };
+struct SliceSpec {
+  int start;
+  int length;
+  int step;
+};
 struct IndexArg {
   enum Kind { IndexK, SliceK, EllipsisK } kind = SliceK;
   int index = 0;
   SliceSpec slice{0, -1, 1};
-  static IndexArg index_of(int i) { IndexArg a; a.kind = IndexK; a.index = i; return a; }
-  static IndexArg from_slice(int start, int length, int step = 1) { IndexArg a; a.kind = SliceK; a.slice = {start, length, step}; return a; }
-  static IndexArg ellipsis() { IndexArg a; a.kind = EllipsisK; return a; }
+  static IndexArg index_of(int i) {
+    IndexArg a;
+    a.kind = IndexK;
+    a.index = i;
+    return a;
+  }
+  static IndexArg from_slice(int start, int length, int step = 1) {
+    IndexArg a;
+    a.kind = SliceK;
+    a.slice = {start, length, step};
+    return a;
+  }
+  static IndexArg ellipsis() {
+    IndexArg a;
+    a.kind = EllipsisK;
+    return a;
+  }
 };
 inline IndexArg idx(int i) { return IndexArg::index_of(i); }
-inline IndexArg sl(int start, int length, int step = 1) { return IndexArg::from_slice(start, length, step); }
+inline IndexArg sl(int start, int length, int step = 1) {
+  return IndexArg::from_slice(start, length, step);
+}
 inline IndexArg ellipsis() { return IndexArg::ellipsis(); }
 
 struct QuantParams {
@@ -324,25 +344,29 @@ public:
     int count_non_ellipsis = 0;
     for (int i = 0; i < (int)specs.size(); ++i) {
       if (specs[i].kind == IndexArg::EllipsisK) {
-        if (ellipsis_pos != -1) throw std::runtime_error("at: multiple ellipsis not allowed");
+        if (ellipsis_pos != -1)
+          throw std::runtime_error("at: multiple ellipsis not allowed");
         ellipsis_pos = i;
       } else {
         count_non_ellipsis++;
       }
     }
     int fill = rank - count_non_ellipsis;
-    if (fill < 0) throw std::runtime_error("at: too many indices");
+    if (fill < 0)
+      throw std::runtime_error("at: too many indices");
     std::vector<IndexArg> items;
     items.reserve(specs.size() + std::max(fill, 0));
     for (int i = 0; i < (int)specs.size(); ++i) {
       if (specs[i].kind == IndexArg::EllipsisK) {
-        for (int k = 0; k < fill; ++k) items.push_back(IndexArg::from_slice(0, -1, 1));
+        for (int k = 0; k < fill; ++k)
+          items.push_back(IndexArg::from_slice(0, -1, 1));
       } else {
         items.push_back(specs[i]);
       }
     }
     if (ellipsis_pos == -1 && (int)specs.size() < rank) {
-      for (int k = 0; k < rank - (int)specs.size(); ++k) items.push_back(IndexArg::from_slice(0, -1, 1));
+      for (int k = 0; k < rank - (int)specs.size(); ++k)
+        items.push_back(IndexArg::from_slice(0, -1, 1));
     }
     TensorPtr cur = shared_from_this();
     int axis = 0;
@@ -351,7 +375,8 @@ public:
         cur = cur->select_view(axis, arg.index);
         // index removes this dim; axis stays
       } else if (arg.kind == IndexArg::SliceK) {
-        cur = cur->slice_view_step(axis, arg.slice.start, arg.slice.length, arg.slice.step);
+        cur = cur->slice_view_step(axis, arg.slice.start, arg.slice.length,
+                                   arg.slice.step);
         axis++; // consumed one dim
       } else {
         throw std::runtime_error("at: unresolved ellipsis");
@@ -363,7 +388,8 @@ public:
     return at(std::vector<IndexArg>(specs));
   }
 
-  // PyTorch-like view helpers: squeeze a size-1 dim and select index along a dim
+  // PyTorch-like view helpers: squeeze a size-1 dim and select index along a
+  // dim
   TensorPtr squeeze_dim_view(int dim) {
     int rank = (int)shape.size();
     if (dim < 0)
@@ -411,9 +437,7 @@ public:
   }
 
   // Convenience: index first dimension and return a copy
-  TensorPtr operator[](int index) {
-    return select_copy(0, index);
-  }
+  TensorPtr operator[](int index) { return select_copy(0, index); }
   TensorPtr operator[](int index) const {
     return const_cast<Tensor *>(this)->select_copy(0, index);
   }
@@ -423,7 +447,8 @@ public:
     // Check broadcast compatibility: src can broadcast to destination shape
     std::vector<int> bshape = broadcast_shape(shape, src->shape);
     if (bshape != shape)
-      throw std::runtime_error("assign_from: src shape not broadcastable to destination");
+      throw std::runtime_error(
+          "assign_from: src shape not broadcastable to destination");
     int rd = (int)shape.size();
     int rs = (int)src->shape.size();
     // Iterate over destination indices
@@ -432,17 +457,20 @@ public:
     for (size_t count = 0; count < total; ++count) {
       // Compute destination element offset using strides
       size_t off_d = 0;
-      for (int j = 0; j < rd; ++j) off_d += (size_t)idx_d[j] * (size_t)strides[j];
+      for (int j = 0; j < rd; ++j)
+        off_d += (size_t)idx_d[j] * (size_t)strides[j];
       // Map to src indices with right-aligned broadcasting
       std::vector<int> idx_s(rs, 0);
       for (int j = 0; j < rs; ++j) {
         int kd = j + (rd - rs);
         int v = (kd >= 0) ? idx_d[kd] : 0;
-        if (src->shape[j] == 1) v = 0; // broadcast dim
+        if (src->shape[j] == 1)
+          v = 0; // broadcast dim
         idx_s[j] = v;
       }
       size_t off_s = 0;
-      for (int j = 0; j < rs; ++j) off_s += (size_t)idx_s[j] * (size_t)src->strides[j];
+      for (int j = 0; j < rs; ++j)
+        off_s += (size_t)idx_s[j] * (size_t)src->strides[j];
       // Write converted value into destination
       float val = src->get_as_float_flat(off_s);
       set_from_float_flat(off_d, val);
@@ -456,9 +484,12 @@ public:
     v->assign_from(src);
   }
   // Convenience: assign at the last dimension index
-  void assign_last(int index, const TensorPtr &src) { select_assign(-1, index, src); }
+  void assign_last(int index, const TensorPtr &src) {
+    select_assign(-1, index, src);
+  }
   // Convenience: assign into a strided slice along an axis
-  void slice_assign(int axis, int start, int length, int step, const TensorPtr &src) {
+  void slice_assign(int axis, int start, int length, int step,
+                    const TensorPtr &src) {
     auto v = slice_view_step(axis, start, length, step);
     v->assign_from(src);
   }
@@ -502,30 +533,30 @@ public:
   }
 
   // PyTorch 风格的类型转换方法，等价于 astype
-  TensorPtr to(DType new_dtype) const {
-    return astype(new_dtype);
-  }
+  TensorPtr to(DType new_dtype) const { return astype(new_dtype); }
 
   // Expand tensor to new shape via broadcasting (no data copy, view only)
   // Only dimensions of size 1 can be expanded to larger sizes
   TensorPtr expand(const std::vector<int> &new_shape) const {
     int rank = (int)shape.size();
     int new_rank = (int)new_shape.size();
-    
+
     // Check if expansion is valid
     if (new_rank < rank) {
-      throw std::runtime_error("expand: new shape must have at least as many dimensions as original");
+      throw std::runtime_error("expand: new shape must have at least as many "
+                               "dimensions as original");
     }
-    
+
     // Validate that only size-1 dimensions are being expanded
     for (int i = 0; i < rank; ++i) {
-      int old_dim = shape[rank - 1 - i];  // right-aligned comparison
+      int old_dim = shape[rank - 1 - i]; // right-aligned comparison
       int new_dim = new_shape[new_rank - 1 - i];
       if (old_dim != 1 && old_dim != new_dim) {
-        throw std::runtime_error("expand: can only expand dimensions of size 1");
+        throw std::runtime_error(
+            "expand: can only expand dimensions of size 1");
       }
     }
-    
+
     // Create new strides for the expanded tensor
     std::vector<int> new_strides(new_rank, 0);
     for (int i = 0; i < new_rank; ++i) {
@@ -543,17 +574,18 @@ public:
         }
       }
     }
-    
-    return const_cast<Tensor*>(this)->view(new_shape, new_strides, 0);
+
+    return const_cast<Tensor *>(this)->view(new_shape, new_strides, 0);
   }
 
   // Repeat tensor along each dimension (creates new memory)
   // Each dimension is repeated the specified number of times
   TensorPtr repeat(const std::vector<int> &repeats) const {
     if (repeats.size() != shape.size()) {
-      throw std::runtime_error("repeat: repeats must have same length as tensor dimensions");
+      throw std::runtime_error(
+          "repeat: repeats must have same length as tensor dimensions");
     }
-    
+
     // Calculate output shape
     std::vector<int> out_shape(shape.size());
     for (size_t i = 0; i < shape.size(); ++i) {
@@ -562,38 +594,39 @@ public:
       }
       out_shape[i] = shape[i] * repeats[i];
     }
-    
+
     auto c = ctx.lock();
-    if (!c) throw std::runtime_error("ctx expired");
+    if (!c)
+      throw std::runtime_error("ctx expired");
     auto out = Tensor::create(c, out_shape, dtype);
-    
+
     // Fill the output tensor by repeating the input
     int rank = (int)shape.size();
     std::vector<int> out_idx(rank, 0);
     size_t total_out = out->nelements();
-    
+
     for (size_t count = 0; count < total_out; ++count) {
       // Map output index to input index
       std::vector<int> in_idx(rank);
       for (int d = 0; d < rank; ++d) {
         in_idx[d] = out_idx[d] % shape[d];
       }
-      
+
       // Calculate linear indices
       size_t in_linear = 0, out_linear = 0;
       for (int d = 0; d < rank; ++d) {
         in_linear += (size_t)in_idx[d] * (size_t)strides[d];
         out_linear += (size_t)out_idx[d] * (size_t)out->strides[d];
       }
-      
+
       // Copy value
       float val = get_as_float_flat(in_linear);
       out->set_from_float_flat(out_linear, val);
-      
+
       // Advance output index
       next_index(out_idx, out_shape);
     }
-    
+
     return out;
   }
 
@@ -1324,9 +1357,11 @@ public:
   }
 
   // Linear with bias: bias supports shapes [n], [1, n], or [m, n]
-  static TensorPtr linear(const TensorPtr &X, const TensorPtr &W, const TensorPtr &bias) {
+  static TensorPtr linear(const TensorPtr &X, const TensorPtr &W,
+                          const TensorPtr &bias) {
     auto Y = matmul_cache_friendly(X, W);
-    if (!bias) return Y;
+    if (!bias)
+      return Y;
     int m = Y->shape[0];
     int n = Y->shape[1];
     // Validate bias dims roughly match output features
@@ -1343,6 +1378,45 @@ public:
     }
     // Broadcasting add
     return Y->tensor_add(Y, bias);
+  }
+
+  // Instance callable: treat this tensor as a Linear weight
+  // Usage: y = (*this)(x); or weight->operator()(x);
+  TensorPtr operator()(const TensorPtr &X) {
+    return Tensor::linear(X, this->shared_from_this());
+  }
+  TensorPtr operator()(const TensorPtr &X, const TensorPtr &bias) {
+    return Tensor::linear(X, this->shared_from_this(), bias);
+  }
+
+  // 便捷重载：根据 X 的形状自动创建 W/B（零初始化）
+  // 等价于 PyTorch 的 nn.Linear(in_features=X.shape[1], out_features, bias)
+  static TensorPtr linear(const TensorPtr &X, int out_features,
+                          bool use_bias = true) {
+    if (!X)
+      throw std::runtime_error("linear(shape): X is null");
+    auto ctx = X->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("linear(shape): ctx expired");
+    if ((int)X->shape.size() != 2)
+      throw std::runtime_error("linear(shape): X must be 2D [m,k]");
+    int k = X->shape[1];
+    // 创建权重 W: [k, out_features]
+    auto W =
+        Tensor::create(ctx, std::vector<int>{k, out_features}, DType::FLOAT32);
+    // 简单零初始化（如需训练或推理加载，请替换为合适的初始化/加载）
+    size_t nw = W->nelements();
+    for (size_t i = 0; i < nw; ++i)
+      W->set_from_float_flat(i, 0.0f);
+
+    TensorPtr B = nullptr;
+    if (use_bias) {
+      B = Tensor::create(ctx, std::vector<int>{out_features}, DType::FLOAT32);
+      size_t nb = B->nelements();
+      for (size_t i = 0; i < nb; ++i)
+        B->set_from_float_flat(i, 0.0f);
+    }
+    return use_bias ? linear(X, W, B) : linear(X, W);
   }
 
   // 专用 1xK · KxN 的并行 matvec（按列块并行），用于 LMHead 大词表场景
@@ -1529,31 +1603,147 @@ public:
     return elementwise_unary(A, [](float a) { return std::sin(a); });
   }
 
+  // 静态：SiLU 激活函数 x * sigmoid(x)
+  static TensorPtr silu(const TensorPtr &A) {
+    if (!A)
+      throw std::runtime_error("silu: input is null");
+    return A->elementwise_unary(A, [](float x) {
+      float s = 1.0f / (1.0f + std::exp(-x));
+      return x * s;
+    });
+  }
+
+  // 静态：ReLU 激活
+  static TensorPtr relu(const TensorPtr &A) {
+    if (!A)
+      throw std::runtime_error("relu: input is null");
+    return A->elementwise_unary(A, [](float v) { return v > 0.0f ? v : 0.0f; });
+  }
+
+  // 静态：Sigmoid 激活
+  static TensorPtr sigmoid(const TensorPtr &A) {
+    if (!A)
+      throw std::runtime_error("sigmoid: input is null");
+    return A->elementwise_unary(
+        A, [](float v) { return 1.0f / (1.0f + std::exp(-v)); });
+  }
+
+  // 静态：Tanh 激活
+  static TensorPtr tanh_act(const TensorPtr &A) {
+    if (!A)
+      throw std::runtime_error("tanh: input is null");
+    return A->elementwise_unary(A, [](float v) { return std::tanh(v); });
+  }
+
+  // 静态：GELU 激活（approximate=true 使用近似公式，false 使用精确erf）
+  static TensorPtr gelu(const TensorPtr &A, bool approximate = true) {
+    if (!A)
+      throw std::runtime_error("gelu: input is null");
+    if (approximate) {
+      const float k0 = std::sqrt(2.0f / 3.14159265358979323846f);
+      return A->elementwise_unary(A, [k0](float x) {
+        float x3 = x * x * x;
+        float t = std::tanh(k0 * (x + 0.044715f * x3));
+        return 0.5f * x * (1.0f + t);
+      });
+    } else {
+      const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+      return A->elementwise_unary(A, [inv_sqrt2](float x) {
+        return 0.5f * x * (1.0f + std::erf(x * inv_sqrt2));
+      });
+    }
+  }
+
+  // 静态：GELU 精确版本便捷包装
+  static TensorPtr gelu_exact(const TensorPtr &A) { return gelu(A, false); }
+
+  // 静态：PyTorch GELU tanh 近似（tanh 近似 erf）
+  static TensorPtr gelu_pytorch_tahn(const TensorPtr &A) {
+    if (!A)
+      throw std::runtime_error("gelu_pytorch_tahn: input is null");
+    const float k0 = std::sqrt(2.0f / 3.14159265358979323846f);
+    return A->elementwise_unary(A, [k0](float x) {
+      float x3 = x * x * x;
+      float t = std::tanh(k0 * (x + 0.044715f * x3));
+      return 0.5f * x * (1.0f + t);
+    });
+  }
+
+  // 静态：Softmax（按指定轴）
+  static TensorPtr softmax(const TensorPtr &X, int axis = -1) {
+    if (!X)
+      throw std::runtime_error("softmax: input is null");
+    if (!X->is_contiguous_row_major())
+      throw std::runtime_error("softmax requires contiguous tensor");
+    auto ctx = X->ctx.lock();
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+    size_t r = X->shape.size();
+    int ax = axis < 0 ? int(r) + axis : axis;
+    if (ax < 0 || ax >= int(r))
+      throw std::runtime_error("softmax axis out of range");
+    int dim = X->shape[ax];
+    size_t outer = 1;
+    for (int i = 0; i < ax; ++i)
+      outer *= (size_t)X->shape[i];
+    size_t inner = 1;
+    for (size_t i = ax + 1; i < r; ++i)
+      inner *= (size_t)X->shape[i];
+    auto Y = Tensor::create(ctx, X->shape, DType::FLOAT32);
+    size_t seg_len = (size_t)dim * inner;
+    for (size_t o = 0; o < outer; ++o) {
+      size_t base = o * seg_len;
+      for (size_t in = 0; in < inner; ++in) {
+        float m = X->get_as_float_flat(base + (size_t)0 * inner + in);
+        for (int j = 1; j < dim; ++j) {
+          size_t idx = base + (size_t)j * inner + in;
+          m = std::max(m, X->get_as_float_flat(idx));
+        }
+        float s = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+          size_t idx = base + (size_t)j * inner + in;
+          s += std::exp(X->get_as_float_flat(idx) - m);
+        }
+        float invs = s > 0 ? (1.0f / s) : 0.0f;
+        for (int j = 0; j < dim; ++j) {
+          size_t idx = base + (size_t)j * inner + in;
+          float e = std::exp(X->get_as_float_flat(idx) - m) * invs;
+          Y->set_from_float_flat(idx, e);
+        }
+      }
+    }
+    return Y;
+  }
+
   // 便捷：元素级幂运算（标量指数）
   TensorPtr tensor_pow(const TensorPtr &A, float exponent) {
-    return elementwise_unary(A, [exponent](float a) { return std::pow(a, exponent); });
+    return elementwise_unary(
+        A, [exponent](float a) { return std::pow(a, exponent); });
   }
 
   // 便捷：元素级幂运算（张量指数）
   TensorPtr tensor_pow(const TensorPtr &A, const TensorPtr &B) {
-    return elementwise_binary(A, B, [](float a, float b) { return std::pow(a, b); });
+    return elementwise_binary(A, B,
+                              [](float a, float b) { return std::pow(a, b); });
   }
 
   // 便捷：张量均值（全局）
   TensorPtr tensor_mean(const TensorPtr &A) {
     auto ctx = A->ctx.lock();
-    if (!ctx) throw std::runtime_error("ctx expired");
-    
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+
     size_t n = A->nelements();
-    if (n == 0) throw std::runtime_error("Cannot compute mean of empty tensor");
-    
+    if (n == 0)
+      throw std::runtime_error("Cannot compute mean of empty tensor");
+
     float sum = 0.0f;
     for (size_t i = 0; i < n; ++i) {
       sum += A->get_as_float_flat(i);
     }
     float mean_val = sum / static_cast<float>(n);
-    
-    auto result = Tensor::create(ctx, {}, DType::FLOAT32);  // 标量张量
+
+    auto result = Tensor::create(ctx, {}, DType::FLOAT32); // 标量张量
     result->set_from_float_flat(0, mean_val);
     return result;
   }
@@ -1561,44 +1751,48 @@ public:
   // 便捷：张量均值（指定轴）
   TensorPtr tensor_mean(const TensorPtr &A, int axis, bool keepdim = false) {
     auto ctx = A->ctx.lock();
-    if (!ctx) throw std::runtime_error("ctx expired");
-    
+    if (!ctx)
+      throw std::runtime_error("ctx expired");
+
     int ndim = static_cast<int>(A->shape.size());
-    if (axis < 0) axis += ndim;
+    if (axis < 0)
+      axis += ndim;
     if (axis < 0 || axis >= ndim) {
       throw std::runtime_error("axis out of range");
     }
-    
+
     // 计算输出形状
     std::vector<int> out_shape;
     for (int i = 0; i < ndim; ++i) {
       if (i != axis) {
         out_shape.push_back(A->shape[i]);
       } else if (keepdim) {
-        out_shape.push_back(1);  // 保持维度，设为1
+        out_shape.push_back(1); // 保持维度，设为1
       }
     }
-    if (out_shape.empty()) out_shape = {1};  // 如果所有维度都被移除，结果是标量
-    
+    if (out_shape.empty())
+      out_shape = {1}; // 如果所有维度都被移除，结果是标量
+
     auto result = Tensor::create(ctx, out_shape, DType::FLOAT32);
-    
+
     // 计算沿指定轴的均值
     size_t axis_size = A->shape[axis];
     size_t outer_size = 1;
     size_t inner_size = 1;
-    
+
     for (int i = 0; i < axis; ++i) {
       outer_size *= A->shape[i];
     }
     for (int i = axis + 1; i < ndim; ++i) {
       inner_size *= A->shape[i];
     }
-    
+
     for (size_t outer = 0; outer < outer_size; ++outer) {
       for (size_t inner = 0; inner < inner_size; ++inner) {
         float sum = 0.0f;
         for (size_t ax = 0; ax < axis_size; ++ax) {
-          size_t src_idx = outer * axis_size * inner_size + ax * inner_size + inner;
+          size_t src_idx =
+              outer * axis_size * inner_size + ax * inner_size + inner;
           sum += A->get_as_float_flat(src_idx);
         }
         float mean_val = sum / static_cast<float>(axis_size);
@@ -1606,7 +1800,7 @@ public:
         result->set_from_float_flat(dst_idx, mean_val);
       }
     }
-    
+
     return result;
   }
 
@@ -1620,9 +1814,7 @@ public:
   }
 
   // 实例方法：支持链式调用的 mean 操作
-  TensorPtr mean() {
-    return tensor_mean(shared_from_this());
-  }
+  TensorPtr mean() { return tensor_mean(shared_from_this()); }
 
   TensorPtr mean(int axis, bool keepdim = false) {
     return tensor_mean(shared_from_this(), axis, keepdim);
