@@ -83,4 +83,102 @@ apply_rotary_pos_emb(const TensorPtr &q, const TensorPtr &k,
   return std::make_tuple(q_embed, k_embed);
 }
 
+// -------------------- 向量切片工具函数 --------------------
+
+/**
+ * @brief 对std::vector进行Python风格的切片操作
+ * 
+ * @tparam T 向量元素类型
+ * @param vec 输入向量
+ * @param start 起始索引（支持负数，-1表示最后一个元素）
+ * @param end 结束索引（不包含，支持负数）
+ * @param step 步长（默认为1）
+ * @return std::vector<T> 切片后的向量
+ * 
+ * 使用示例：
+ * - slice_vector(vec, 0, -1)  // 等价于 vec[:-1]，去掉最后一个元素
+ * - slice_vector(vec, 1, -1)  // 等价于 vec[1:-1]，去掉首尾元素
+ * - slice_vector(vec, -3, -1) // 等价于 vec[-3:-1]，倒数第3到倒数第2个元素
+ * - slice_vector(vec, 0, vec.size(), 2) // 等价于 vec[::2]，每隔一个元素取一个
+ */
+template<typename T>
+std::vector<T> slice_vector(const std::vector<T>& vec, int start, int end, int step = 1) {
+    if (vec.empty()) return {};
+    if (step <= 0) throw std::runtime_error("slice_vector: step must be positive");
+    
+    int size = static_cast<int>(vec.size());
+    
+    // 处理负数索引
+    if (start < 0) start += size;
+    if (end < 0) end += size;
+    
+    // 边界检查和调整
+    start = std::max(0, std::min(start, size));
+    end = std::max(0, std::min(end, size));
+    
+    if (start >= end) return {};
+    
+    std::vector<T> result;
+    for (int i = start; i < end; i += step) {
+        result.push_back(vec[i]);
+    }
+    
+    return result;
+}
+
+/**
+ * @brief 专门用于shape向量的切片函数，提供常用的切片操作
+ */
+namespace shape_utils {
+    
+    /**
+     * @brief 获取除最后一维外的所有维度 (等价于 shape[:-1])
+     */
+    inline std::vector<int> all_but_last(const std::vector<int>& shape) {
+        return slice_vector(shape, 0, -1);
+    }
+    
+    /**
+     * @brief 获取除第一维外的所有维度 (等价于 shape[1:])
+     */
+    inline std::vector<int> all_but_first(const std::vector<int>& shape) {
+        return slice_vector(shape, 1, static_cast<int>(shape.size()));
+    }
+    
+    /**
+     * @brief 获取最后n维 (等价于 shape[-n:])
+     */
+    inline std::vector<int> last_n_dims(const std::vector<int>& shape, int n) {
+        return slice_vector(shape, -n, static_cast<int>(shape.size()));
+    }
+    
+    /**
+     * @brief 获取前n维 (等价于 shape[:n])
+     */
+    inline std::vector<int> first_n_dims(const std::vector<int>& shape, int n) {
+        return slice_vector(shape, 0, n);
+    }
+    
+    /**
+     * @brief 获取中间的维度 (等价于 shape[start:end])
+     */
+    inline std::vector<int> middle_dims(const std::vector<int>& shape, int start, int end) {
+        return slice_vector(shape, start, end);
+    }
+    
+    /**
+     * @brief 获取最后一个维度的大小
+     */
+    inline int last_dim(const std::vector<int>& shape) {
+        return shape.empty() ? 0 : shape.back();
+    }
+    
+    /**
+     * @brief 获取第一个维度的大小
+     */
+    inline int first_dim(const std::vector<int>& shape) {
+        return shape.empty() ? 0 : shape.front();
+    }
+}
+
 } // namespace ow::nn

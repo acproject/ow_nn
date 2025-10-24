@@ -93,6 +93,7 @@ struct Qwen3VLTextConfig {
   bool attention_bias = false;
   std::optional<std::vector<std::string>> layer_types = std::nullopt;
   double attention_dropout = 0.0;
+  std::optional<int> sliding_window = std::nullopt;
 
   std::string model_type = "qwen3_vl";
   std::string base_config_key = "vision_config";
@@ -563,6 +564,152 @@ struct Qwen3RMSNorm {
     auto in_dtype = hidden_states->dtype;
     auto variance = hidden_states->pow(2)->mean(-1, true);
     return Tensor::matmul_cache_friendly(weight, variance)->astype(input_dtype);
+  }
+
+  std::string extre_repe() const {
+    return std::string("(") + std::to_string(weight ? weight->shape[0] : 0) +
+           ")" + ", eps=" + std::to_string(variance_epsilon);
+  }
+};
+
+struct Qwen3Attention {
+  /// Multi-headed attention from 'Attention Is All You Need' paper
+
+  // Configuration and layer info
+  std::shared_ptr<Context> ctx;
+  Qwen3VLTextConfig config;
+  int layer_idx;
+  std::optional<std::string> layer_type;
+
+  // Attention parameters
+  int head_dim;
+  int num_key_value_groups;
+  float scaling;
+  double attention_dropout;
+  bool is_causal;
+  std::optional<int> sliding_window;
+
+  // Linear projection layers (weights)
+  TensorPtr q_proj_weight;
+  TensorPtr k_proj_weight;
+  TensorPtr v_proj_weight;
+  TensorPtr o_proj_weight;
+
+  // Optional bias tensors
+  TensorPtr q_proj_bias;
+  TensorPtr k_proj_bias;
+  TensorPtr v_proj_bias;
+  TensorPtr o_proj_bias;
+
+  // RMS normalization layers
+  std::unique_ptr<Qwen3RMSNorm> q_norm;
+  std::unique_ptr<Qwen3RMSNorm> k_norm;
+
+  Qwen3Attention(const std::shared_ptr<Context> &ctx,
+                 const Qwen3VLTextConfig &config, int layer_idx)
+      : ctx(ctx), config(config), layer_idx(layer_idx) {
+
+    if (!ctx)
+      throw std::runtime_error("Qwen3Attention: ctx expired");
+
+    // Initialize layer type
+    if (config.layer_types.has_value() &&
+        layer_idx < config.layer_types->size()) {
+      layer_type = (*config.layer_types)[layer_idx];
+    }
+
+    // Calculate head_dim (similar to Python: getattr(config, "head_dim",
+    // config.hidden_size // config.num_attention_heads))
+    head_dim = config.head_dim > 0
+                   ? config.head_dim
+                   : config.hidden_size / config.num_attention_heads;
+
+    // Calculate num_key_value_groups
+    num_key_value_groups =
+        config.num_attention_heads / config.num_key_value_heads;
+
+    // Calculate scaling factor
+    scaling = std::pow(head_dim, -0.5f);
+
+    // Set attention parameters
+    attention_dropout = config.attention_dropout;
+    is_causal = true;
+
+    // Set sliding window
+    if (layer_type.has_value() && layer_type.value() == "sliding_attention") {
+      sliding_window = config.sliding_window;
+    } else {
+      sliding_window = std::nullopt;
+    }
+
+    // Initialize projection layer weights
+    // q_proj: [hidden_size, num_attention_heads * head_dim]
+    q_proj_weight = Tensor::create(
+        ctx, {config.hidden_size, config.num_attention_heads * head_dim},
+        DType::FLOAT32);
+
+    // k_proj: [hidden_size, num_key_value_heads * head_dim]
+    k_proj_weight = Tensor::create(
+        ctx, {config.hidden_size, config.num_key_value_heads * head_dim},
+        DType::FLOAT32);
+
+    // v_proj: [hidden_size, num_key_value_heads * head_dim]
+    v_proj_weight = Tensor::create(
+        ctx, {config.hidden_size, config.num_key_value_heads * head_dim},
+        DType::FLOAT32);
+
+    // o_proj: [num_attention_heads * head_dim, hidden_size]
+    o_proj_weight = Tensor::create(
+        ctx, {config.num_attention_heads * head_dim, config.hidden_size},
+        DType::FLOAT32);
+
+    // Initialize bias tensors if attention_bias is enabled
+    if (config.attention_bias) {
+      q_proj_bias = Tensor::create(ctx, {config.num_attention_heads * head_dim},
+                                   DType::FLOAT32);
+      k_proj_bias = Tensor::create(ctx, {config.num_key_value_heads * head_dim},
+                                   DType::FLOAT32);
+      v_proj_bias = Tensor::create(ctx, {config.num_key_value_heads * head_dim},
+                                   DType::FLOAT32);
+      o_proj_bias = Tensor::create(ctx, {config.hidden_size}, DType::FLOAT32);
+    }
+
+    // Initialize RMS normalization layers
+    q_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+    k_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+  }
+
+  // Linear projection helper functions
+  TensorPtr q_proj(const TensorPtr &x) const {
+    if (config.attention_bias && q_proj_bias) {
+      return Tensor::linear(x, q_proj_weight, q_proj_bias);
+    } else {
+      return Tensor::linear(x, q_proj_weight);
+    }
+  }
+
+  TensorPtr k_proj(const TensorPtr &x) const {
+    if (config.attention_bias && k_proj_bias) {
+      return Tensor::linear(x, k_proj_weight, k_proj_bias);
+    } else {
+      return Tensor::linear(x, k_proj_weight);
+    }
+  }
+
+  TensorPtr v_proj(const TensorPtr &x) const {
+    if (config.attention_bias && v_proj_bias) {
+      return Tensor::linear(x, v_proj_weight, v_proj_bias);
+    } else {
+      return Tensor::linear(x, v_proj_weight);
+    }
+  }
+
+  TensorPtr o_proj(const TensorPtr &x) const {
+    if (config.attention_bias && o_proj_bias) {
+      return Tensor::linear(x, o_proj_weight, o_proj_bias);
+    } else {
+      return Tensor::linear(x, o_proj_weight);
+    }
   }
 };
 

@@ -1216,6 +1216,256 @@ inline OpNode make_slice_view_node(const std::string &in,
   return n;
 }
 
+// ---------------- Shape utilities as ops ----------------
+inline TensorPtr shape_of(const TensorPtr &X) {
+  if (!X)
+    throw std::runtime_error("shape_of: null input");
+  auto ctx = get_ctx_or_throw(X);
+  int r = (int)X->shape.size();
+  auto S = Tensor::create(ctx, std::vector<int>{r}, DType::INT32);
+  for (int i = 0; i < r; ++i) {
+    S->set_from_float_flat(i, (float)X->shape[i]);
+  }
+  return S;
+}
+
+inline TensorPtr shape_slice(const TensorPtr &X, int start, int length,
+                             int step = 1) {
+  auto S = shape_of(X);
+  return slice(S, 0, start, length, step);
+}
+
+inline OpNode make_shape_of_node(const std::string &in,
+                                 const std::string &out) {
+  OpNode n;
+  n.name = "shape_of";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &vs,
+            const std::unordered_map<std::string, std::string> &) {
+    return shape_of(vs[0]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_of infer: needs 1 input");
+    TensorDesc td;
+    td.shape = {(int)ids[0].shape.size()};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_shape_slice_node(const std::string &in,
+                                    const std::string &out, int start,
+                                    int length, int step = 1) {
+  OpNode n;
+  n.name = "shape_slice";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [start, length, step](const std::vector<TensorPtr> &vs,
+                               const std::unordered_map<std::string, std::string> &) {
+    return shape_slice(vs[0], start, length, step);
+  };
+  n.infer = [start, length, step](const std::vector<TensorDesc> &ids,
+                                  const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_slice infer: needs 1 input");
+    int size_d = (int)ids[0].shape.size();
+    int s = start;
+    if (s < 0)
+      s += size_d;
+    if (s < 0 || s >= size_d)
+      throw std::runtime_error("shape_slice infer: start out of range");
+    int len = (length < 0) ? (size_d - s) : length;
+    if (len <= 0 || s + len > size_d)
+      throw std::runtime_error("shape_slice infer: length out of range");
+    int st = std::max(step, 1);
+    int out_len = (st == 1) ? len : (len + st - 1) / st;
+    TensorDesc td;
+    td.shape = {out_len};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
+// Convenience shape ops wrapping shape_slice
+inline TensorPtr shape_all_but_last(const TensorPtr &X) {
+  return shape_slice(X, 0, -1, 1);
+}
+inline TensorPtr shape_all_but_first(const TensorPtr &X) {
+  return shape_slice(X, 1, -1, 1);
+}
+inline TensorPtr shape_first_n(const TensorPtr &X, int n) {
+  return shape_slice(X, 0, n, 1);
+}
+inline TensorPtr shape_last_n(const TensorPtr &X, int n) {
+  return shape_slice(X, -n, -1, 1);
+}
+inline TensorPtr shape_select(const TensorPtr &X, int index) {
+  return shape_slice(X, index, 1, 1);
+}
+inline TensorPtr shape_rank(const TensorPtr &X) {
+  auto ctx = get_ctx_or_throw(X);
+  auto R = Tensor::create(ctx, std::vector<int>{1}, DType::INT32);
+  R->set_from_float_flat(0, (float)X->shape.size());
+  return R;
+}
+
+inline OpNode make_shape_all_but_last_node(const std::string &in,
+                                           const std::string &out) {
+  OpNode n;
+  n.name = "shape_all_but_last";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &vs,
+            const std::unordered_map<std::string, std::string> &) {
+    return shape_all_but_last(vs[0]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_all_but_last infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int out_len = std::max(0, r - 1);
+    TensorDesc td;
+    td.shape = {out_len};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_shape_all_but_first_node(const std::string &in,
+                                            const std::string &out) {
+  OpNode n;
+  n.name = "shape_all_but_first";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &vs,
+            const std::unordered_map<std::string, std::string> &) {
+    return shape_all_but_first(vs[0]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_all_but_first infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int out_len = std::max(0, r - 1);
+    TensorDesc td;
+    td.shape = {out_len};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_shape_first_n_node(const std::string &in,
+                                      const std::string &out, int n) {
+  OpNode nnode;
+  nnode.name = "shape_first_n";
+  nnode.inputs = {in};
+  nnode.output = out;
+  nnode.fn = [n](const std::vector<TensorPtr> &vs,
+                 const std::unordered_map<std::string, std::string> &) {
+    return shape_first_n(vs[0], n);
+  };
+  nnode.infer = [n](const std::vector<TensorDesc> &ids,
+                    const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_first_n infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int out_len = std::max(0, std::min(n, r));
+    TensorDesc td;
+    td.shape = {out_len};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return nnode;
+}
+
+inline OpNode make_shape_last_n_node(const std::string &in,
+                                     const std::string &out, int n) {
+  OpNode nnode;
+  nnode.name = "shape_last_n";
+  nnode.inputs = {in};
+  nnode.output = out;
+  nnode.fn = [n](const std::vector<TensorPtr> &vs,
+                 const std::unordered_map<std::string, std::string> &) {
+    return shape_last_n(vs[0], n);
+  };
+  nnode.infer = [n](const std::vector<TensorDesc> &ids,
+                    const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_last_n infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int out_len = std::max(0, std::min(n, r));
+    TensorDesc td;
+    td.shape = {out_len};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return nnode;
+}
+
+inline OpNode make_shape_select_node(const std::string &in,
+                                     const std::string &out, int index) {
+  OpNode n;
+  n.name = "shape_select";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [index](const std::vector<TensorPtr> &vs,
+                 const std::unordered_map<std::string, std::string> &) {
+    return shape_select(vs[0], index);
+  };
+  n.infer = [index](const std::vector<TensorDesc> &ids,
+                    const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_select infer: needs 1 input");
+    int r = (int)ids[0].shape.size();
+    int ix = index < 0 ? r + index : index;
+    if (ix < 0 || ix >= r)
+      throw std::runtime_error("shape_select infer: index out of range");
+    TensorDesc td;
+    td.shape = {1};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
+inline OpNode make_shape_rank_node(const std::string &in,
+                                   const std::string &out) {
+  OpNode n;
+  n.name = "shape_rank";
+  n.inputs = {in};
+  n.output = out;
+  n.fn = [](const std::vector<TensorPtr> &vs,
+            const std::unordered_map<std::string, std::string> &) {
+    return shape_rank(vs[0]);
+  };
+  n.infer = [](const std::vector<TensorDesc> &ids,
+               const std::unordered_map<std::string, std::string> &) {
+    if (ids.size() != 1)
+      throw std::runtime_error("shape_rank infer: needs 1 input");
+    TensorDesc td;
+    td.shape = {1};
+    td.strides = Tensor::calc_strides(td.shape);
+    td.dtype = DType::INT32;
+    return td;
+  };
+  return n;
+}
+
 inline OpNode make_concat_node(const std::vector<std::string> &ins,
                                const std::string &out, int axis) {
   OpNode n;
@@ -1653,22 +1903,22 @@ inline OpNode make_repeat_node(const std::string &in, const std::string &out,
 
 // pow 操作实现函数（标量指数）
 inline TensorPtr pow_scalar(const TensorPtr &X, float exponent) {
-  return Tensor::tensor_pow(X, exponent);
+  return X->pow(exponent);
 }
 
 // pow 操作实现函数（张量指数）
 inline TensorPtr pow_tensor(const TensorPtr &X, const TensorPtr &exponent) {
-  return Tensor::tensor_pow(X, exponent);
+  return X->pow(exponent);
 }
 
 // mean 操作实现函数（全局均值）
 inline TensorPtr mean_global(const TensorPtr &X) {
-  return Tensor::tensor_mean(X);
+  return X->mean();
 }
 
 // mean 操作实现函数（指定轴均值）
 inline TensorPtr mean_axis(const TensorPtr &X, int axis, bool keepdim = false) {
-  return Tensor::tensor_mean(X, axis, keepdim);
+  return X->mean(axis, keepdim);
 }
 
 // 类型转换操作实现函数
@@ -1744,8 +1994,8 @@ inline OpNode make_mean_global_node(const std::string &in,
       throw std::runtime_error("mean_global infer: need input tensor");
     TensorDesc td;
     td.dtype = DType::FLOAT32;
-    td.shape = {}; // 标量张量
-    td.strides = {};
+    td.shape.clear(); // 标量张量
+    td.strides.clear();
     return td;
   };
   return n;
@@ -2005,6 +2255,77 @@ inline void register_standard_ops() {
         int length = attr_i(attrs, "length", -1);
         int step = attr_i(attrs, "step", 1);
         return make_slice_view_node(ins[0], out, axis, start, length, step);
+      });
+  // shape ops
+  R.register_factory(
+      "shape_of",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_of needs 1 input");
+        return make_shape_of_node(ins[0], out);
+      });
+  R.register_factory(
+      "shape_slice",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_slice needs 1 input");
+        int start = attr_i(attrs, "start", 0);
+        int length = attr_i(attrs, "length", -1);
+        int step = attr_i(attrs, "step", 1);
+        return make_shape_slice_node(ins[0], out, start, length, step);
+      });
+  R.register_factory(
+      "shape_all_but_last",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_all_but_last needs 1 input");
+        return make_shape_all_but_last_node(ins[0], out);
+      });
+  R.register_factory(
+      "shape_all_but_first",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_all_but_first needs 1 input");
+        return make_shape_all_but_first_node(ins[0], out);
+      });
+  R.register_factory(
+      "shape_first_n",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_first_n needs 1 input");
+        int n = attr_i(attrs, "n", 1);
+        return make_shape_first_n_node(ins[0], out, n);
+      });
+  R.register_factory(
+      "shape_last_n",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_last_n needs 1 input");
+        int n = attr_i(attrs, "n", 1);
+        return make_shape_last_n_node(ins[0], out, n);
+      });
+  R.register_factory(
+      "shape_select",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_select needs 1 input");
+        int index = attr_i(attrs, "index", 0);
+        return make_shape_select_node(ins[0], out, index);
+      });
+  R.register_factory(
+      "shape_rank",
+      [](const std::vector<std::string> &ins, const std::string &out,
+         const std::unordered_map<std::string, std::string> &attrs) {
+        if (ins.size() != 1)
+          throw std::runtime_error("shape_rank needs 1 input");
+        return make_shape_rank_node(ins[0], out);
       });
   R.register_factory(
       "unsqueeze",
@@ -2375,6 +2696,44 @@ public:
                            const SliceOrder &order) {
     return slice_view(in, out, order.axis, order.start, order.length,
                       order.step);
+  }
+  // Shape helpers
+  GraphBuilder &shape_of(const std::string &in, const std::string &out) {
+    return apply("shape_of", {in}, out);
+  }
+  GraphBuilder &shape_slice(const std::string &in, const std::string &out,
+                            int start, int length, int step = 1) {
+    std::unordered_map<std::string, std::string> attrs{
+        {"start", std::to_string(start)},
+        {"length", std::to_string(length)},
+        {"step", std::to_string(step)}};
+    return apply("shape_slice", {in}, out, attrs);
+  }
+  GraphBuilder &shape_all_but_last(const std::string &in,
+                                   const std::string &out) {
+    return apply("shape_all_but_last", {in}, out);
+  }
+  GraphBuilder &shape_all_but_first(const std::string &in,
+                                    const std::string &out) {
+    return apply("shape_all_but_first", {in}, out);
+  }
+  GraphBuilder &shape_first_n(const std::string &in, const std::string &out,
+                              int n) {
+    std::unordered_map<std::string, std::string> attrs{{"n", std::to_string(n)}};
+    return apply("shape_first_n", {in}, out, attrs);
+  }
+  GraphBuilder &shape_last_n(const std::string &in, const std::string &out,
+                             int n) {
+    std::unordered_map<std::string, std::string> attrs{{"n", std::to_string(n)}};
+    return apply("shape_last_n", {in}, out, attrs);
+  }
+  GraphBuilder &shape_select(const std::string &in, const std::string &out,
+                             int index) {
+    std::unordered_map<std::string, std::string> attrs{{"index", std::to_string(index)}};
+    return apply("shape_select", {in}, out, attrs);
+  }
+  GraphBuilder &shape_rank(const std::string &in, const std::string &out) {
+    return apply("shape_rank", {in}, out);
   }
   GraphBuilder &avg_pool2d(const std::string &in, const std::string &out,
                            int kh = 2, int kw = 2, int sh = 2, int sw = 2,
