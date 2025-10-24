@@ -1,5 +1,6 @@
 #pragma once
 #include "context.hpp"
+#include "ops.hpp"
 #include "tensor.hpp"
 #include "utils.hpp"
 
@@ -1132,8 +1133,9 @@ struct Qwen3MLP {
     } else if (std::holds_alternative<TensorPtr>(act_fn)) {
       const auto &act_tensor = std::get<TensorPtr>(act_fn);
       if (act_tensor) {
-        down_proj = down_proj->tensor_mul(
-            act_tensor->silu((*this->gate_proj)(x)), (*this->up_proj)(x));
+        // 在这里这接选择用silu激活
+        down_proj = down_proj->tensor_mul(silu((*this->gate_proj)(x)),
+                                          (*this->up_proj)(x));
       }
     }
     return down_proj;
