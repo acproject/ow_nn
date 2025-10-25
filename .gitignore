@@ -153,3 +153,4 @@ third_party/llama.cpp
 model
 model2
 model2/**
+.venv

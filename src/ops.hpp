@@ -1816,7 +1816,7 @@ inline OpNode make_add_node(const std::string &a, const std::string &b,
   n.output = out;
   n.fn = [](const std::vector<TensorPtr> &ins,
             const std::unordered_map<std::string, std::string> &) {
-    return Tensor::tensor_add(ins[0], ins[1]);
+    return ins[0]->tensor_add(ins[0], ins[1]);
   };
   n.infer = [](const std::vector<TensorDesc> &ids,
                const std::unordered_map<std::string, std::string> &) {
@@ -1840,7 +1840,7 @@ inline OpNode make_sub_node(const std::string &a, const std::string &b,
   n.output = out;
   n.fn = [](const std::vector<TensorPtr> &ins,
             const std::unordered_map<std::string, std::string> &) {
-    return Tensor::tensor_sub(ins[0], ins[1]);
+    return ins[0]->tensor_sub(ins[0], ins[1]);
   };
   n.infer = [](const std::vector<TensorDesc> &ids,
                const std::unordered_map<std::string, std::string> &) {
@@ -1864,7 +1864,7 @@ inline OpNode make_mul_node(const std::string &a, const std::string &b,
   n.output = out;
   n.fn = [](const std::vector<TensorPtr> &ins,
             const std::unordered_map<std::string, std::string> &) {
-    return Tensor::tensor_mul(ins[0], ins[1]);
+    return ins[0]->tensor_mul(ins[0], ins[1]);
   };
   n.infer = [](const std::vector<TensorDesc> &ids,
                const std::unordered_map<std::string, std::string> &) {

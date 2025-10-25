@@ -64,5 +64,15 @@ add_custom_command(TARGET ow_nn_main PRE_LINK
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ow_nn_main>"
 )
 
+# 算子级测试可执行
+add_executable(ops_tests ${CMAKE_SOURCE_DIR}/tests/ops_tests.cpp)
+target_link_libraries(ops_tests PRIVATE ow_nn)
+set_target_properties(ops_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
+)
+add_custom_command(TARGET ops_tests PRE_LINK
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ops_tests>"
+)
+
 # 导出编译命令（用于IDE）
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

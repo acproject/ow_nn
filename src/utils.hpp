@@ -101,14 +101,16 @@ static inline TensorPtr rotate_half(const TensorPtr &x) {
   std::vector<int> starts1(r, 0);
   std::vector<int> lens1 = x->shape;
   lens1[last] = half;
-  auto x1 = x->slice_view(starts1, lens1);
+  auto x1v = x->slice_view(starts1, lens1);
+  auto x1 = x1v->copy(); // ensure contiguous for concat
 
   // x2 = x[..., half:]
   std::vector<int> starts2(r, 0);
   starts2[last] = half;
   std::vector<int> lens2 = x->shape;
   lens2[last] = L - half;
-  auto x2 = x->slice_view(starts2, lens2);
+  auto x2v = x->slice_view(starts2, lens2);
+  auto x2 = x2v->copy(); // ensure contiguous for concat
 
   // -x2
   auto nx2 = x2->elementwise_unary(x2, [](float v) { return -v; });

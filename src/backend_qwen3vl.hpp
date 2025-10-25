@@ -87,6 +87,10 @@ struct Qwen3VLTextConfig {
   double rms_norm_eps = 1e-6;
   bool use_cache = true;
   bool tie_word_embedding = false;
+  // Q/K RMSNorm 默认启用（符合 Qwen3 官方实现）
+  bool use_qk_rmsnorm = true;
+  // 控制是否应用因果掩码，默认启用（符合大多数解码器自注意力）
+  bool is_causal = true;
 
   std::optional<std::variant<RopeParameters,
                              std::unordered_map<std::string, RopeParameters>>>
@@ -377,7 +381,12 @@ struct Qwen3VLTextRotaryEmbedding : public LlamaRotaryEmbedding {
     lc.num_hidden_layers = cfg.num_hidden_layers;
     lc.num_attention_heads = cfg.num_attention_heads;
     lc.num_key_value_heads = cfg.num_key_value_heads;
-    lc.hidden_act = cfg.hidden_act;
+    if (std::holds_alternative<std::string>(cfg.hidden_act)) {
+      lc.hidden_act = std::get<std::string>(cfg.hidden_act);
+    } else {
+      // 默认回退至常用激活函数，保证与 LlamaConfig 类型一致
+      lc.hidden_act = "silu";
+    }
     lc.max_position_embeddings = cfg.max_position_embeddings;
     lc.initializer_range = cfg.initializer_range;
     lc.rms_norm_eps = cfg.rms_norm_eps;
@@ -550,6 +559,7 @@ struct Qwen3RMSNorm {
     variance_epsilon = eps;
   }
   TensorPtr forward(const TensorPtr &hidden_states) {
+    // 参数校验
     if (!hidden_states || !weight)
       throw std::runtime_error("Qwen3RMSNorm: null input or weight");
     auto ctx = hidden_states->ctx.lock();
@@ -558,13 +568,42 @@ struct Qwen3RMSNorm {
     auto shape = hidden_states->shape;
     if (shape.empty())
       throw std::runtime_error("Qwen3RMSNorm: input rank must be >= 1");
-    // 获取最后一个维度作为hidden_size, 其余维度合并为 batch_seq
+
+    // 获取最后一维作为 hidden_size，其余维度合并为 batch_seq
     int hidden_size = shape.back();
-    auto input_dtype = hidden_states->dtype;
     size_t batch_seq = hidden_states->nelements() / hidden_size;
     auto in_dtype = hidden_states->dtype;
-    auto variance = hidden_states->pow(2)->mean(-1, true);
-    return Tensor::matmul_cache_friendly(weight, variance)->astype(input_dtype);
+
+    // 创建输出张量，统一使用 float32 进行计算
+    auto Y = Tensor::create(ctx, shape, DType::FLOAT32);
+
+    // 遍历每个 token（或 patch）向量
+    for (size_t i = 0; i < batch_seq; ++i) {
+      // 1. 计算该向量元素的平方均值（方差）
+      float variance = 0.0f;
+      for (int j = 0; j < hidden_size; ++j) {
+        float v = hidden_states->get_as_float_flat(i * hidden_size + j);
+        variance += v * v;
+      }
+      variance /= (float)hidden_size;
+
+      // 2. 计算 rsqrt(variance + epsilon)，与Python实现一致
+      float rsqrt_var = 1.0f / std::sqrt(variance + variance_epsilon);
+
+      // 3. 归一化后乘以可学习权重，写入输出
+      for (int j = 0; j < hidden_size; ++j) {
+        float v = hidden_states->get_as_float_flat(i * hidden_size + j);
+        float normalized = v * rsqrt_var;
+        float w = weight->get_as_float_flat(j);
+        Y->set_from_float_flat(i * hidden_size + j, normalized * w);
+      }
+    }
+
+    // 如果原始 dtype 不是 float32，则转换回去
+    if (in_dtype != DType::FLOAT32) {
+      return Y->astype(in_dtype);
+    }
+    return Y;
   }
 
   std::string extre_repe() const {
@@ -754,8 +793,13 @@ struct PastKeyValueCache {
     int L_active = active_seq_len();
     auto k_slice = k_caches[layer_idx]->slice_view_step(1, 0, L_active, 1);
     auto v_slice = v_caches[layer_idx]->slice_view_step(1, 0, L_active, 1);
-    auto k_out = permute_view(k_slice, {0, 2, 1, 3});
-    auto v_out = permute_view(v_slice, {0, 2, 1, 3});
+    auto k_out_pv = permute_view(k_slice, {0, 2, 1, 3});
+    auto v_out_pv = permute_view(v_slice, {0, 2, 1, 3});
+    // Return contiguous k/v tensors
+    auto k_out = Tensor::create(ctx, k_out_pv->shape, k_out_pv->dtype);
+    k_out->assign_from(k_out_pv);
+    auto v_out = Tensor::create(ctx, v_out_pv->shape, v_out_pv->dtype);
+    v_out->assign_from(v_out_pv);
     return {k_out, v_out};
   }
 };
@@ -825,7 +869,8 @@ struct Qwen3Attention {
     scaling = std::pow(head_dim, -0.5f);
 
     attention_dropout = config.attention_dropout;
-    is_causal = true;
+    // 从配置读取是否因果掩码
+    is_causal = config.is_causal;
 
     // sliding window if layer type is sliding_attention
     if (layer_type.has_value() && layer_type.value() == "sliding_attention") {
@@ -859,9 +904,11 @@ struct Qwen3Attention {
       o_proj_bias = Tensor::create(ctx, {config.hidden_size}, DType::FLOAT32);
     }
 
-    // RMSNorm layers
-    q_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
-    k_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+    // RMSNorm layers（受配置开关控制）
+    if (config.use_qk_rmsnorm) {
+      q_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+      k_norm = std::make_unique<Qwen3RMSNorm>(ctx, head_dim, config.rms_norm_eps);
+    }
 
     // KV cache capacity
     max_seq_len_cached = config.max_position_embeddings;
@@ -957,29 +1004,41 @@ struct Qwen3Attention {
     int num_heads = config.num_attention_heads;
     int num_kv_heads = config.num_key_value_heads;
 
-    // Reshape to [B,S,heads,D] then permute to [B,heads,S,D]
+    // Reshape to [B,S,heads,D] first, then apply RMSNorm on each head
     auto q_4d = q_all->reshape_view({B, S, num_heads, head_dim});
     auto k_4d = k_all->reshape_view({B, S, num_kv_heads, head_dim});
     auto v_4d = v_all->reshape_view({B, S, num_kv_heads, head_dim});
+
+    // Apply RMSNorm to Q and K after reshaping (matching Python implementation)
+    if (q_norm && q_norm->weight) {
+      // Apply RMSNorm on the last dimension (head_dim) for each head
+      q_4d = q_norm->forward(q_4d);
+    }
+    if (k_norm && k_norm->weight) {
+      // Apply RMSNorm on the last dimension (head_dim) for each head
+      k_4d = k_norm->forward(k_4d);
+    }
 
     auto q = permute_view(q_4d, {0, 2, 1, 3});
     auto k = permute_view(k_4d, {0, 2, 1, 3});
     auto v = permute_view(v_4d, {0, 2, 1, 3});
 
-    // RMSNorm and scale
-    float eps = (float)config.rms_norm_eps;
-    auto rms_inline = [eps](const TensorPtr &x) -> TensorPtr {
-      auto var = x->pow(2.0f)->mean(-1, true);
-      auto rsqrt = var->elementwise_unary(
-          var, [eps](float v) { return 1.0f / std::sqrt(v + eps); });
-      return x->tensor_mul(x, rsqrt);
-    };
-    q = rms_inline(q);
-    k = rms_inline(k);
-    if (q_norm && q_norm->weight)
-      q = q->tensor_mul(q, q_norm->weight);
-    if (k_norm && k_norm->weight)
-      k = k->tensor_mul(k, k_norm->weight);
+    // Ensure q/k/v are contiguous after permutation
+    if (!q->is_contiguous_row_major()) {
+      auto q_cont = Tensor::create(ctx_local, q->shape, q->dtype);
+      q_cont->assign_from(q);
+      q = q_cont;
+    }
+    if (!k->is_contiguous_row_major()) {
+      auto k_cont = Tensor::create(ctx_local, k->shape, k->dtype);
+      k_cont->assign_from(k);
+      k = k_cont;
+    }
+    if (!v->is_contiguous_row_major()) {
+      auto v_cont = Tensor::create(ctx_local, v->shape, v->dtype);
+      v_cont->assign_from(v);
+      v = v_cont;
+    }
     float scale = scaling;
     q = q->elementwise_unary(q, [scale](float v) { return v * scale; });
 
@@ -1017,20 +1076,29 @@ struct Qwen3Attention {
         auto q_bh = q->select_view(0, b)->select_view(0, hidx);
         auto k_bkv = k_active->select_view(0, b)->select_view(0, kv_h);
         auto k_T = k_bkv->transpose_view(0, 1);
+        // Ensure k_T is contiguous for matmul
+        if (!k_T->is_contiguous_row_major()) {
+          auto k_T_cont = Tensor::create(ctx_local, k_T->shape, k_T->dtype);
+          k_T_cont->assign_from(k_T);
+          k_T = k_T_cont;
+        }
+        
         auto scores = Tensor::matmul_cache_friendly(q_bh, k_T); // [S, L_keys]
 
-        // Causal mask
+        // Causal mask（仅当启用因果掩码时）
         const float NEG_INF = -1e9f;
-        auto causal_mask =
-            Tensor::create(ctx_local, {S, L_keys}, DType::FLOAT32);
-        for (int i = 0; i < S; ++i) {
-          int i_abs = L_prev + i;
-          for (int j = 0; j < L_keys; ++j) {
-            float m = (j > i_abs) ? NEG_INF : 0.0f;
-            causal_mask->set_from_float_flat((size_t)i * L_keys + j, m);
+        if (is_causal) {
+          auto causal_mask =
+              Tensor::create(ctx_local, {S, L_keys}, DType::FLOAT32);
+          for (int i = 0; i < S; ++i) {
+            int i_abs = L_prev + i;
+            for (int j = 0; j < L_keys; ++j) {
+              float m = (j > i_abs) ? NEG_INF : 0.0f;
+              causal_mask->set_from_float_flat((size_t)i * L_keys + j, m);
+            }
           }
+          scores = scores->tensor_add(scores, causal_mask);
         }
-        scores = scores->tensor_add(scores, causal_mask);
 
         // Attention mask broadcastable to [S, L_keys]
         if (attention_mask) {
@@ -1064,8 +1132,11 @@ struct Qwen3Attention {
       }
     }
 
-    auto attn_flat = permute_view(attn_out, {0, 2, 1, 3})
-                         ->reshape_view({BS, num_heads * head_dim});
+    auto attn_perm = permute_view(attn_out, {0, 2, 1, 3});
+    // Materialize attn_perm as contiguous before reshape
+    auto attn_perm_cont = Tensor::create(ctx_local, attn_perm->shape, attn_perm->dtype);
+    attn_perm_cont->assign_from(attn_perm);
+    auto attn_flat = attn_perm_cont->reshape_view({BS, num_heads * head_dim});
     auto out = o_proj(attn_flat);
     if (rank == 3) {
       return out->reshape_view({B, S, Hsz});
@@ -1075,6 +1146,7 @@ struct Qwen3Attention {
   }
 };
 
+#ifdef OW_NN_ENABLE_QWEN3MLP
 struct Qwen3MLP {
   int hidden_size = 0;
   int intermediate_size = 0;
@@ -1141,5 +1213,6 @@ struct Qwen3MLP {
     return down_proj;
   }
 };
+#endif // OW_NN_ENABLE_QWEN3MLP
 
 } // namespace ow::nn
